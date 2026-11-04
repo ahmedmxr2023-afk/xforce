@@ -102,6 +102,30 @@ so it is a fresh TriStation project whose POUs came from the XML.
    - `snapEventId="0"` in a stored block means "no snapshot event", **not** a collapsed box.
      TriStation writes it for blocks drawn in the editor; treating it as collapsed dropped the
      block's pins and made it an error block on import.
+   - The element's own catalogue entry must carry its interface in `Collection Name="Declarations"`.
+     TriStation compares an instance's snapshot pins with that collection when the project is
+     opened; an inserted POU left it empty, so every instance of that type was "out of date"
+     and the editor drew a red diagonal slash across the block. `BuildProjectTypes` now
+     rewrites the collection from the same interface pins used for the snapshots.
+   - A branch arm in the decomposed net that has fewer than two points is not a drawable wire.
+     TriStation rejects it as an overlapping segment (`WF0032`). Those arms are now suppressed;
+     the block pin is stored as a direct link (`effectiveParam` = source expression,
+     `connectId` = source element), which is how the importer stores zero-length links.
+
+### Source defects seen in the M23 export
+
+Opening is clean, but some M23 programs cannot be *built* because the PLCopen export lost data
+that is not recoverable from the XML:
+
+| Symptom | Cause |
+|---|---|
+| `TN0090` duplicate `MBN.xxxx` addresses (215 tags) on TriStation's own import | the export declares one address for many tags; `pt2conv` re-allocates them, TriStation's importer does not |
+| `WG0018` unconnected `PACK16` inputs (`P02`, `P03`) | constant placements (literal `0`) were omitted from the export; only the netlist edge survives |
+| `WC0140` "Feature not implemented" (`P04`) | the export declares `ADD` blocks over BOOL signals; TriStation has no BOOL addition |
+| no execution list | the export carries no `ExecutionList` task; TriStation's import leaves it empty (`WB0237` on build), `pt2conv` schedules every program |
+
+These are reported rather than silently "repaired": inventing logic (for example rewriting
+`ADD` to `OR`) would change the safety application.
 
 ## Measured parity (SULFUR1 reference, original embedded base)
 
