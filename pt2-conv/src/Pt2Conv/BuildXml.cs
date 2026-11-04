@@ -113,6 +113,7 @@ public static class BuildXml
         // library element to the installed library's identity (dogTag + FName/streams), so the
         // catalogue, the .EMA binaries and the block snapshots all speak the same ids.
         RebaseLibraryElements(tree);
+        AdoptSheetTemplates(tree);
 
         // Snapshot of the template tree (after CRC normalisation) for the fast path: when the
         // converted project ends up identical to the template, the template container can be
@@ -954,6 +955,92 @@ public static class BuildXml
         return outp;
     }
 
+    /// <summary>Replaces the embedded base's sheet-template elements with the identities and
+    /// drawings of the installed STDSHEET library. The base was captured with an older STDSHEET,
+    /// so its DogTag/FName no longer exist in the installed library; TriStation then shows
+    /// "sheet template no longer exists in this project" and cannot open the drawings.</summary>
+    private static void AdoptSheetTemplates(List<(string Path, byte[] Data)> tree)
+    {
+        int px = tree.FindIndex(t => t.Path.Equals("Current/Project.xml", StringComparison.OrdinalIgnoreCase));
+        if (px < 0) return;
+        XDocument doc;
+        try { doc = XDocument.Parse(Encoding.UTF8.GetString(tree[px].Data), LoadOptions.PreserveWhitespace); }
+        catch { return; }
+        var elements = doc.Descendants().FirstOrDefault(e =>
+            e.Name.LocalName == "Collection" && (string?)e.Attribute("Name") == "Elements");
+        if (elements == null) return;
+
+        JsonDocument res;
+        try
+        {
+            using var s = typeof(BuildXml).Assembly.GetManifestResourceStream("Pt2Conv.Resources.stdsheet.json");
+            if (s == null) return;
+            using var reader = new StreamReader(s, Encoding.UTF8);
+            res = JsonDocument.Parse(reader.ReadToEnd());
+        }
+        catch { return; }
+
+        int adopted = 0;
+        foreach (var prop in res.RootElement.EnumerateObject())
+        {
+            string name = prop.Name;
+            var e = elements.Elements().FirstOrDefault(x =>
+                x.Name.LocalName == "Class" &&
+                string.Equals((string?)x.Attribute("ElemName"), name, StringComparison.OrdinalIgnoreCase));
+            if (e == null) continue;
+
+            string oldF = (string?)e.Attribute("FName") ?? "";
+            string newF = prop.Value.GetProperty("fName").GetString() ?? oldF;
+            string ext = prop.Value.GetProperty("ext").GetString() ?? ".BKG";
+            if (oldF.Length == 0 || newF.Length == 0) continue;
+
+            e.SetAttributeValue("DogTag", IntText(prop.Value, "dogTag"));
+            e.SetAttributeValue("FName", newF);
+            e.SetAttributeValue("Flags", prop.Value.GetProperty("flags").GetString() ?? "10");
+            var ver = e.Elements().FirstOrDefault(x =>
+                x.Name.LocalName == "Class" && (string?)x.Attribute("Embed") == "ElemVersion");
+            if (ver != null)
+            {
+                ver.SetAttributeValue("VerMajor", IntText(prop.Value, "verMajor"));
+                ver.SetAttributeValue("VerMinor", IntText(prop.Value, "verMinor"));
+                ver.SetAttributeValue("eventId", IntText(prop.Value, "eventId"));
+                if (prop.Value.TryGetProperty("date", out var dt) && dt.GetString() is { Length: > 0 } ds)
+                    ver.SetAttributeValue("date", ds);
+                ver.SetAttributeValue("user", IntText(prop.Value, "user"));
+            }
+
+            byte[] bkg = Convert.FromBase64String(prop.Value.GetProperty("bkg").GetString() ?? "");
+            string dirPrefix = "Current/Elements/" + name + "/";
+            for (int i = 0; i < tree.Count; i++)
+            {
+                if (!tree[i].Path.StartsWith(dirPrefix, StringComparison.OrdinalIgnoreCase)) continue;
+                string rel = tree[i].Path[dirPrefix.Length..];
+                bool crc = rel.EndsWith("_crc", StringComparison.OrdinalIgnoreCase);
+                string stem = crc ? rel[..^4] : rel;
+                int dot = stem.IndexOf('.');
+                string fileStem = dot > 0 ? stem[..dot] : stem;
+                string fileExt = dot > 0 ? stem[dot..] : "";
+                if (!fileStem.Equals(oldF, StringComparison.OrdinalIgnoreCase)) continue;
+                string newRel = newF + fileExt + (crc ? "_crc" : "");
+                var data = crc ? Array.Empty<byte>() : bkg;
+                tree[i] = (dirPrefix + newRel, data);
+            }
+            adopted++;
+        }
+
+        if (adopted > 0)
+        {
+            var text = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n" + doc.Root!.ToString(SaveOptions.DisableFormatting);
+            tree[px] = ("Current/Project.xml", Encoding.UTF8.GetBytes(text));
+            Console.WriteLine($"  sheet templates adopted from installed STDSHEET ({adopted})");
+        }
+    }
+
+    private static string IntText(JsonElement e, string name)
+        => e.TryGetProperty(name, out var v)
+            ? (v.ValueKind == JsonValueKind.Number ? v.GetRawText() : (v.GetString() ?? "0"))
+            : "0";
+
     private static void RebaseLibraryElements(List<(string Path, byte[] Data)> tree)
     {
         int px = tree.FindIndex(t => t.Path.Equals("Current/Project.xml", StringComparison.OrdinalIgnoreCase));
@@ -970,6 +1057,18 @@ public static class BuildXml
         var renames = new List<(string Name, string OldF, string NewF)>();
         var dogMap = new Dictionary<int, int>();
         bool changed = false;
+        // DogTags/FNames must stay unique across the whole catalogue. The captured library data
+        // can name a value that another element already owns (e.g. REAL_TO_DINT -> 99 collides
+        // with the STDSHEET sheets at 93..100); applying it hides the sheet templates and makes
+        // TriStation ask "no longer exists in this project" and fail to read the project.
+        var usedDog = new HashSet<int>();
+        var usedF = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in elements.Elements().Where(e => e.Name.LocalName == "Class"))
+        {
+            if (int.TryParse((string?)c.Attribute("DogTag"), out int d)) usedDog.Add(d);
+            string f = (string?)c.Attribute("FName") ?? "";
+            if (f.Length > 0) usedF.Add(f);
+        }
         foreach (var c in elements.Elements().Where(e => e.Name.LocalName == "Class"))
         {
             string lib = (string?)c.Attribute("LibID") ?? "";
@@ -979,14 +1078,23 @@ public static class BuildXml
 
             if (int.TryParse((string?)c.Attribute("DogTag"), out int curDog) && curDog != newDog)
             {
-                dogMap[curDog] = newDog;
-                c.SetAttributeValue("DogTag", newDog.ToString(CultureInfo.InvariantCulture));
                 string canon = newDog.ToString("x8", CultureInfo.InvariantCulture);
                 string oldF0 = (string?)c.Attribute("FName") ?? "";
-                if (oldF0.Length > 0 && !oldF0.Equals(canon, StringComparison.OrdinalIgnoreCase))
+                bool collides = (usedDog.Contains(newDog) && curDog != newDog)
+                                || (oldF0.Length > 0 && usedF.Contains(canon) && !oldF0.Equals(canon, StringComparison.OrdinalIgnoreCase));
+                if (!collides)
                 {
-                    c.SetAttributeValue("FName", canon);
-                    renames.Add((name, oldF0, canon));
+                    usedDog.Remove(curDog);
+                    usedF.Remove(oldF0);
+                    dogMap[curDog] = newDog;
+                    c.SetAttributeValue("DogTag", newDog.ToString(CultureInfo.InvariantCulture));
+                    if (oldF0.Length > 0 && !oldF0.Equals(canon, StringComparison.OrdinalIgnoreCase))
+                    {
+                        c.SetAttributeValue("FName", canon);
+                        renames.Add((name, oldF0, canon));
+                    }
+                    usedDog.Add(newDog);
+                    usedF.Add(canon);
                 }
             }
 
