@@ -2204,27 +2204,24 @@ public static partial class FbdGenerator
             foreach (var type in p.Blocks.OrderBy(b => b.Sheet).ThenBy(b => b.DocIndex).Select(b => b.TypeName).Distinct())
             {
                 int count = snapCopies * p.Blocks.Count(b => b.TypeName == type);
+                // Project-defined types must be written from their own catalogue identity; the
+                // template loader also registers them in Lib, and mixing the two identities
+                // (block 82 vs snapshot 41) makes the editor drop the blocks.
+                if (projectTypes != null && projectTypes.TryGetValue(type, out var pt))
+                {
+                    sb.Append($"<Class name=\"{Esc(type)}\" dogTag=\"{pt.DogTag}\" type=\"{pt.ElemType}\" subType=\"0\"")
+                      .Append($" instanceCount=\"{count}\" commentCount=\"0\" extOptFlags=\"{pt.ExtOptFlags}\"")
+                      .Append($" cemEventInputs=\"{pt.CemEI}\" cemActionOutputs=\"{pt.CemAO}\">")
+                      .Append($"<Class Embed=\"eventConnectionsChanged\" eventType=\"0\" eventId=\"{pt.EventId}\" date=\"{Esc(pt.Date)}\" user=\"{pt.User}\"/>")
+                      .Append("<Collection Name=\"declarations\" ClassType=\"CTS2Vars\" CollectionType=\"1\">");
+                    foreach (var pin in pt.Pins)
+                        sb.Append($"<Class name=\"{Esc(pin.Name)}\" dataType=\"{Esc(pin.DataType)}\" initVal=\"{Esc(pin.InitVal)}\" desc=\"{Esc(pin.Desc)}\"")
+                          .Append($" varVTType=\"{pin.Vt}\" refCount=\"{pin.RefCount}\" fbRefCount=\"{pin.FbRefCount}\" flags=\"{pin.Flags}\" writes=\"0\"/>");
+                    sb.Append("</Collection></Class>");
+                    continue;
+                }
                 if (!Lib.TryGetValue(type, out var m))
                 {
-                    // A project POU (function block defined by this project): write its catalogue
-                    // identity and interface so instances in other POUs resolve.
-                    if (projectTypes != null && projectTypes.TryGetValue(type, out var pt))
-                    {
-                        // Project function blocks are written exactly the way TriStation's own
-                        // importer writes them: the catalogue DogTag, interface subType 0, the
-                        // element's ExtOptionFlags and a live eventConnectionsChanged record.
-                        // (Library elements keep their subtype and event from the platform.)
-                        sb.Append($"<Class name=\"{Esc(type)}\" dogTag=\"{pt.DogTag}\" type=\"{pt.ElemType}\" subType=\"0\"")
-                          .Append($" instanceCount=\"{count}\" commentCount=\"0\" extOptFlags=\"{pt.ExtOptFlags}\"")
-                          .Append($" cemEventInputs=\"{pt.CemEI}\" cemActionOutputs=\"{pt.CemAO}\">")
-                          .Append($"<Class Embed=\"eventConnectionsChanged\" eventType=\"0\" eventId=\"{pt.EventId}\" date=\"{Esc(pt.Date)}\" user=\"{pt.User}\"/>")
-                          .Append("<Collection Name=\"declarations\" ClassType=\"CTS2Vars\" CollectionType=\"1\">");
-                        foreach (var pin in pt.Pins)
-                            sb.Append($"<Class name=\"{Esc(pin.Name)}\" dataType=\"{Esc(pin.DataType)}\" initVal=\"{Esc(pin.InitVal)}\" desc=\"{Esc(pin.Desc)}\"")
-                              .Append($" varVTType=\"{pin.Vt}\" refCount=\"{pin.RefCount}\" fbRefCount=\"{pin.FbRefCount}\" flags=\"{pin.Flags}\" writes=\"0\"/>");
-                        sb.Append("</Collection></Class>");
-                        continue;
-                    }
                     sb.Append($"<Class name=\"{Esc(type)}\" dogTag=\"0\" type=\"8\" subType=\"1\" instanceCount=\"{count}\"")
                       .Append(" commentCount=\"0\" extOptFlags=\"0\" cemEventInputs=\"0\" cemActionOutputs=\"0\">")
                       .Append("<Class Embed=\"eventConnectionsChanged\" eventType=\"0\" eventId=\"0\" date=\"\" user=\"2\"/>")
