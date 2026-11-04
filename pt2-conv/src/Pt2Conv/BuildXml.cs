@@ -1402,11 +1402,11 @@ public static class BuildXml
             try
             {
                 map[name] = FbdGenerator.BuildProjectType(xmlPath, name);
-                // Do NOT append the compiler temps from our own listing: TriStation's stored
-                // interface contains only the declared variables (its compiler adds/updates
-                // temps itself when the project is built). Writing a different temp set makes
-                // every instance of the block an out-of-date interface, which the editor draws
-                // as a red diagonal slash over the block.
+                // Compiler temps are part of the interface the editor compares: TriStation's
+                // unbuilt import stores them in the element's Declarations and in every
+                // instance snapshot. Both sides are written from this same list, so they stay
+                // consistent; omitting them marks each instance out of date (red X).
+                foreach (var temp in FbdGenerator.TempPins(xmlPath, name)) map[name].Pins.Add(temp);
             }
             catch { /* a malformed POU keeps the unknown-type fallback */ }
         }
