@@ -35,7 +35,17 @@ dotnet pt2conv.dll buildxml project.xml project.pt2x
 | POU with no body | warning | Kept as a declaration only. |
 | More than one configuration / task | warning | Only the first execution list is carried over. |
 | Cause & Effect (CEM) data | warning | Not converted. |
-| No tag declarations | warning | The tag database falls back to the template. |
+| No tag declarations | warning | The tag database is written with TriStation's import defaults for typed columns. |
+
+### Tag columns with no XML source
+
+A TriStation export does not carry every `Tagnames.csv` column. For columns such as
+`Retentive`, `IOModuleConfig`, `IOModuleTrigger`, `AI_Unit`, `PI_PointType`,
+`PI_PointGearTeeth` and `PI_PointGearRatio`, `pt2conv` first keeps the scaffold project's
+value for a tag with the same name and otherwise writes the value TriStation's importer
+assigns (`False`, `0`, `0`, `mA`, `00`, `01`, `1.000000`). Leaving those cells empty makes
+TriStation refuse to open the container (`WB0045: Error detected while reading file`), even
+though every element, diagram and CRC is valid.
 
 ## Validation method
 

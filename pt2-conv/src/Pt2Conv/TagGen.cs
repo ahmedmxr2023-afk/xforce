@@ -188,6 +188,12 @@ public static class TagGen
                 }
                 if (val.Length == 0 && tmpl.TryGetValue(name, out var trow2) && ci >= 0 && ci < trow2.Count)
                     val = trow2[ci];
+                // Columns TriStation fills with a fixed default at import time. Leaving them
+                // empty makes the target project unreadable (TriStation reports WB0045 and
+                // refuses to open the container), so write the importer's own values when the
+                // XML carries no source and the scaffold has no matching tag.
+                if (val.Length == 0 && ColumnDefaults.TryGetValue(c, out var fallback))
+                    val = fallback;
                 fields.Add(val);
             }
 
@@ -396,6 +402,22 @@ public static class TagGen
 
     private static readonly HashSet<string> HwColumns = new(StringComparer.OrdinalIgnoreCase)
     { "IOModuleConfig", "IOModuleTrigger", "AI_Unit" };
+
+    /// <summary>Values TriStation's XML importer writes when the source export carries no
+    /// value for a column and the scaffold project has no tag with that name. These are
+    /// required: an empty cell in a typed column makes TriStation fail to read the project
+    /// (WB0045 "Error detected while reading file"). Captured from a genuine 5.8 import
+    /// (all 1,021 M23 tags carry exactly these values).</summary>
+    private static readonly Dictionary<string, string> ColumnDefaults = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Retentive"] = "False",
+        ["IOModuleConfig"] = "0",
+        ["IOModuleTrigger"] = "0",
+        ["AI_Unit"] = "mA",
+        ["PI_PointType"] = "00",
+        ["PI_PointGearTeeth"] = "01",
+        ["PI_PointGearRatio"] = "1.000000",
+    };
 
     /// <summary>The template's own Address per tag - the target project's existing assignment.</summary>
     private static Dictionary<string, string> TemplateAddresses(

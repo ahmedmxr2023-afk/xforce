@@ -23,12 +23,17 @@ so it is a fresh TriStation project whose POUs came from the XML.
    Therefore a generated FBD POU must be **synthesised** in the catalog; cloning a donor
    (the old behaviour) is impossible and wrong (`LibID`, `Flags`, `Locked`, `ExtOptionFlags`
    all differ).
-   The embedded `Resources/base.pt2x.gz` is the reference project itself (library + hardware
-   + its POUs). A generated POU whose content matches the template keeps the template's
-   exact stream (localIds, `network` handles, emission order, timestamps); when the whole
-   project ends up unchanged, the template container bytes are reused, so the output file is
-   byte-for-byte identical to the professional conversion. User POUs the XML does not
-   define are removed from the embedded base (library elements are kept). The extraction is
+   The embedded `Resources/base.pt2x.gz` is now a **neutral scaffold captured from a TriStation
+   5.8 import on the installed library** (library + sheet templates + hardware, no user POUs).
+   Earlier it was the SULFUR1 reference project itself, whose library identities came from an
+   older installation; that made TriStation reject regenerated projects with `WB0045` ("Error
+   detected while reading file"). The scaffold now carries the installed library layout
+   (`LibID` 2/3/4/5, DogTags 4..363) and the current STDSHEET template identities, so every
+   generated project refers to library elements the installed archives actually contain.
+   A generated POU whose content matches the template keeps the template's exact stream
+   (localIds, `network` handles, emission order, timestamps); when the whole project ends up
+   unchanged, the template container bytes are reused. User POUs the XML does not define are
+   removed from the embedded base (library elements are kept). The extraction is
    cached by content hash, so replacing the resource invalidates the old cache.
 
 2. **Element identity is derived from the import order.**
@@ -98,7 +103,13 @@ so it is a fresh TriStation project whose POUs came from the XML.
      TriStation writes it for blocks drawn in the editor; treating it as collapsed dropped the
      block's pins and made it an error block on import.
 
-## Measured parity (embedded base, same XML)
+## Measured parity (SULFUR1 reference, original embedded base)
+
+> This measurement was taken when `base.pt2x.gz` was the SULFUR1 reference project itself.
+> The embedded base is now a neutral installed-5.8 scaffold (see above), so a fresh SULFUR1
+> conversion no longer reproduces that container byte-for-byte; the FBD/stream parity findings
+> below are unchanged.
+
 
 `pt2conv verify out.pt2x` → 786/786 CRCs OK, OLE container valid. Stream set identical
 (1573 streams, no additions/removals). `pt2conv diff` against the reference:
