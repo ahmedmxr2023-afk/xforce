@@ -2520,8 +2520,11 @@ public static partial class FbdGenerator
         // eventConnectionsChanged id for a function block defined by this project. Emitting 0
         // for those leaves the instance unresolved (red cross in the editor).
         int snapEvent = 0;
-        if (Lib.TryGetValue(b.TypeName, out var m)) snapEvent = m.EventId;
-        else if (plan.ProjectTypes != null && plan.ProjectTypes.TryGetValue(b.TypeName, out var pt)) snapEvent = pt.EventId;
+        // A project-defined function block must be tied to its own catalogue event, not to the
+        // template's stale snapshot identity (the template loader also registers project FBs in
+        // Lib, which would otherwise win here and leave the instance with a red cross).
+        if (plan.ProjectTypes != null && plan.ProjectTypes.TryGetValue(b.TypeName, out var pt)) snapEvent = pt.EventId;
+        else if (Lib.TryGetValue(b.TypeName, out var m)) snapEvent = m.EventId;
         sb.Append($" snapEventId=\"{snapEvent}\"")
           .Append($" enEnO=\"False\" doubleSpace=\"{(b.DoubleSpace ? "True" : "False")}\"")
           .Append(" sequence=\"0\">");

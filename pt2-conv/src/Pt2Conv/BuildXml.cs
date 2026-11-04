@@ -1427,6 +1427,8 @@ public static class BuildXml
                     if (int.TryParse((string?)ev.Attribute("user"), out int usr)) info.User = usr;
                     info.Date = (string?)ev.Attribute("date") ?? "";
                 }
+                if (Environment.GetEnvironmentVariable("PT2_DEBUG_EVENTS") == "1" && n.Equals("FB04_DI", StringComparison.OrdinalIgnoreCase))
+                    Console.Error.WriteLine($"[ev] {n} dog={info.DogTag} type={info.ElemType} conn={info.EventId}");
             }
         }
         catch { /* catalogue is best-effort */ }
