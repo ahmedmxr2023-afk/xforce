@@ -36,6 +36,21 @@ function escapeDisposition(value: string): string {
   return value.replace(/["\r\n]/g, "_");
 }
 
+/**
+ * Turns any of the accepted body shapes into a readable stream of Buffers.
+ *
+ * Do not hand a Uint8Array to Readable.from() directly: it iterates a typed array byte by
+ * byte, so the request receives numbers instead of chunks and Node fails the upload with
+ * "The 'chunk' argument must be of type string or an instance of Buffer or Uint8Array"
+ * (about two minutes later, once the socket has drained). Wrapping it in an array keeps the
+ * payload as a single Buffer chunk.
+ */
+function bodySource(body: Uint8Array | ReadableStream<Uint8Array> | Readable): Readable {
+  if (body instanceof Readable) return body;
+  if (body instanceof Uint8Array) return Readable.from([Buffer.from(body)]);
+  return Readable.fromWeb(body as Parameters<typeof Readable.fromWeb>[0]);
+}
+
 // Chunks the multipart body as a stream so a large upload is never held fully in memory.
 async function* multipartParts(form: FormData, boundary: string): AsyncGenerator<Buffer> {
   for (const [name, value] of form.entries()) {
@@ -80,12 +95,7 @@ export async function postEngineRaw(
   const url = new URL(endpoint);
   const transport = url.protocol === "https:" ? https : http;
 
-  const source =
-    body instanceof Readable
-      ? body
-      : body instanceof Uint8Array
-        ? Readable.from(body)
-        : Readable.fromWeb(body as Parameters<typeof Readable.fromWeb>[0]);
+  const source = bodySource(body);
 
   return new Promise((resolve, reject) => {
     const request = transport.request(
@@ -154,12 +164,7 @@ export async function postEngineBytes(
   const url = new URL(endpoint);
   const transport = url.protocol === "https:" ? https : http;
 
-  const source =
-    body instanceof Readable
-      ? body
-      : body instanceof Uint8Array
-        ? Readable.from(body)
-        : Readable.fromWeb(body as Parameters<typeof Readable.fromWeb>[0]);
+  const source = bodySource(body);
 
   return new Promise((resolve, reject) => {
     const request = transport.request(

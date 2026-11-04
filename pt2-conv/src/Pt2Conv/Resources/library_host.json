@@ -1,0 +1,21 @@
+﻿{
+    "version":  "5.8",
+    "files":  {
+                  "STDLIB.LT2X":  {
+                                      "size":  565760,
+                                      "sha256":  "70e865bdeea1888b72670e06e5c6cae924b44a4f8c9db34b92a4a38b2f218005"
+                                  },
+                  "STDSHEET.LT2X":  {
+                                        "size":  192000,
+                                        "sha256":  "6e5f28f102245a7c1f85892a82593f1c72a7f609803ea076b862bbf400f64d4e"
+                                    },
+                  "TCXLIB.LT2X":  {
+                                      "size":  910848,
+                                      "sha256":  "932884a36710fc42f4198c3d787204e90ba45cbddc98f8a0fc30731029bb4917"
+                                  },
+                  "Tx1Lib.lt2X":  {
+                                      "size":  2057728,
+                                      "sha256":  "243fce0b9c4c397600b9977d060f16c8824300581ef01e93678e8d51eef20a15"
+                                  }
+              }
+}

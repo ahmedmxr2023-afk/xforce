@@ -504,13 +504,45 @@ app.MapPost("/api/inspect", async (HttpRequest request) =>
 // managed drawing -- no TriStation, licence or Windows dependency. Same bearer token as /convert.
 app.MapPost("/api/pdf", async (HttpRequest request) =>
 {
-    var (file, filename, form, error) = await ReadUploadAsync(request, authToken);
-    if (file is null) return error!;
+    // Two clients call this. A browser upload posts multipart/form-data; the site's job page
+    // reads a stored .pt2x from disk and forwards it as the raw body ("View as PDF" on a
+    // finished job). Accept both, and take the name from the query string for the raw form.
+    byte[] bytes;
+    string filename;
+    IFormCollection? form = null;
 
-    await using var stream = file.OpenReadStream();
-    using var buffer = new MemoryStream();
-    await stream.CopyToAsync(buffer, request.HttpContext.RequestAborted);
-    var bytes = Pt2Importer.DecompressIfGzip(buffer.ToArray());
+    if (request.HasFormContentType)
+    {
+        var (file, uploadedName, uploadedForm, error) = await ReadUploadAsync(request, authToken);
+        if (file is null) return error!;
+
+        await using var stream = file.OpenReadStream();
+        using var buffer = new MemoryStream();
+        await stream.CopyToAsync(buffer, request.HttpContext.RequestAborted);
+        bytes = buffer.ToArray();
+        filename = uploadedName!;
+        form = uploadedForm;
+    }
+    else
+    {
+        if (!IsAuthorized(request, authToken))
+        {
+            return Results.Json(new { error = "unauthorized" }, statusCode: StatusCodes.Status401Unauthorized);
+        }
+
+        using var buffer = new MemoryStream();
+        await request.Body.CopyToAsync(buffer, request.HttpContext.RequestAborted);
+        if (buffer.Length == 0)
+        {
+            return Results.Json(new { error = "No source file was uploaded." }, statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        bytes = buffer.ToArray();
+        var rawName = request.Query["name"].FirstOrDefault();
+        filename = string.IsNullOrWhiteSpace(rawName) ? "project.pt2x" : Path.GetFileName(rawName);
+    }
+
+    bytes = Pt2Importer.DecompressIfGzip(bytes);
 
     if (!Pt2Importer.LooksLikePt2(bytes))
     {
@@ -521,7 +553,7 @@ app.MapPost("/api/pdf", async (HttpRequest request) =>
 
     var projectName = form?["name"].FirstOrDefault() ?? request.Query["name"].FirstOrDefault();
     var mode = Pt2xPdf.ParseMode(form?["mode"].FirstOrDefault() ?? request.Query["mode"].FirstOrDefault());
-    var rendered = await Pt2xPdf.RenderAsync(bytes, filename!, projectName, mode, request.HttpContext.RequestAborted);
+    var rendered = await Pt2xPdf.RenderAsync(bytes, filename, projectName, mode, request.HttpContext.RequestAborted);
     if (!rendered.Success)
     {
         return Results.Json(

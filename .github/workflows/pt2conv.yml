@@ -1,0 +1,49 @@
+name: pt2conv
+
+on:
+  push:
+    paths:
+      - "pt2-conv/**"
+      - "tools/Convert-Matrix.ps1"
+      - ".github/workflows/pt2conv.yml"
+  pull_request:
+    paths:
+      - "pt2-conv/**"
+
+jobs:
+  build-and-verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "7.0.x"
+
+      - name: Build
+        run: dotnet build pt2-conv/src/Pt2Conv/Pt2Conv.csproj -c Release
+
+      - name: Container round-trip (extract base -> rebuild -> verify)
+        shell: pwsh
+        run: |
+          $tool = "pt2-conv/src/Pt2Conv/bin/Release/net7.0/pt2conv.dll"
+          $work = Join-Path $env:RUNNER_TEMP "base"
+          dotnet $tool base --extract $work | Out-Host
+          dotnet $tool rebuild $work (Join-Path $env:RUNNER_TEMP "base.pt2x") | Out-Host
+          $verify = dotnet $tool verify (Join-Path $env:RUNNER_TEMP "base.pt2x") 2>&1 | Out-String
+          Write-Host $verify
+          if ($verify -notmatch "CRC verified OK") { throw "CRC verification failed" }
+          if ($verify -notmatch "VALID") { throw "OLE container is not valid" }
+          if ($LASTEXITCODE -ne 0) { throw "verify failed" }
+
+      - name: CLI contract (check --json)
+        shell: pwsh
+        run: |
+          $tool = "pt2-conv/src/Pt2Conv/bin/Release/net7.0/pt2conv.dll"
+          # No corpus is shipped with the repo; assert the JSON contract on a trivial file.
+          Set-Content -Path "$env:RUNNER_TEMP/empty.xml" -Value "<not-plcopen/>"
+          $out = dotnet $tool check "$env:RUNNER_TEMP/empty.xml" --json 2>&1 | Out-String
+          Write-Host $out
+          $json = $out | ConvertFrom-Json
+          if ($null -eq $json.canConvert) { throw "check --json did not return canConvert" }
+          if ($json.canConvert) { throw "non-PLCopen input must not be convertible" }

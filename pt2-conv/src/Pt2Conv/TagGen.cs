@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using Pt2Conv.Cfb;
@@ -35,10 +35,12 @@ public static class TagGen
     /// placeholders. Returns the CSV text and, via <paramref name="report"/>, a
     /// per-column classification (supplied / HW-IO / missing).
     /// </summary>
-    public static string GenerateCsv(string xmlPath, string tmplCsv, AddrMode mode, out string report)
+    public static string GenerateCsv(string xmlPath, string tmplCsv, AddrMode mode, out string report,
+        IReadOnlySet<string>? forceMultiWrite = null)
     {
         var xmlTags = ParseXmlTags(xmlPath);
         Console.WriteLine($"XML tags: {xmlTags.Count}");
+        var tagPrograms = ParseProgramUsage(xmlPath);
 
         var lines = tmplCsv.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
         var cols = SplitCsv(lines[1]);
@@ -71,7 +73,94 @@ public static class TagGen
                 Pa: xmlTags[n].GetValueOrDefault("POINT_ASSIGNMENT.PhysicalAddress", ""),
                 DataType: xmlTags[n].GetValueOrDefault("@type", "")))
             .ToList();
-        var addrMap = AssignAddresses(paOrder, mode, TemplateAddresses(tmpl, cols));
+        var addrMap = AssignAddresses(paOrder, mode, TemplateAddresses(tmpl, cols), TemplateTypes(tmpl, cols));
+
+        // Aliased tags: USER_ALIAS entries define an alias (MBR.<number>) and DEFAULT_ALIAS
+        // entries without a number read one of those aliases. TriStation allows the reader and
+        // its target to share the MBR address; two different alias numbers at the same address
+        // are what it rejects (TN0090/TN0116).
+        var aliasTargets = new List<(string Legacy, string Extended, string Address)>();
+        var usedAliasNumbers = new HashSet<int>();
+        var usedMbrNumbers = new HashSet<int>();
+        foreach (var kv in addrMap)
+        {
+            var mm = Regex.Match(kv.Value ?? "", @"^MBR\.(\d+)$");
+            if (mm.Success && int.TryParse(mm.Groups[1].Value, out int mn)) usedMbrNumbers.Add(mn);
+        }
+        foreach (var nm in order)
+        {
+            var fl = xmlTags[nm];
+            string an = fl.GetValueOrDefault("POINT_ASSIGNMENT.AliasNumber", "0");
+            if (!fl.GetValueOrDefault("POINT_ASSIGNMENT.AliasCategory", "").Equals("USER_ALIAS", StringComparison.OrdinalIgnoreCase)) continue;
+            if (an.Length == 0 || an == "0" || !int.TryParse(an, out int anum)) continue;
+            string pa = fl.GetValueOrDefault("POINT_ASSIGNMENT.PhysicalAddress", "");
+            if (pa.Length == 0) pa = "MBR." + (anum - 12000).ToString("0000");
+            aliasTargets.Add((an, fl.GetValueOrDefault("POINT_ASSIGNMENT.AliasNumberExt", (120000 + (anum - 12000)).ToString()), pa));
+            usedAliasNumbers.Add(anum);
+        }
+
+        // Aliased tags whose XML carries no alias number (lossy "*_Replicated" exports strip both
+        // AliasNumber and PhysicalAddress) are allocated by TriStation from the point class that
+        // matches the alias type and the tag's data type:
+        //   READ  + BOOL -> MBR (12001+/120001+)   READ  + numeric -> MIR (31001+/320001+)
+        //   WRITE + BOOL -> MBW (2001+/20001+)     WRITE + numeric -> MIW (40251+/415001+)
+        // Seed each used set with the points the table will already carry.
+        var usedAliasPoints = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["MBR"] = new(), ["MIR"] = new(), ["MBW"] = new(), ["MIW"] = new()
+        };
+        void NotePoint(string? addr)
+        {
+            var mm = Regex.Match(addr ?? "", @"^(MBR|MIR|MBW|MIW)\.(\d+)$");
+            if (mm.Success && int.TryParse(mm.Groups[2].Value, out int mn))
+                usedAliasPoints[mm.Groups[1].Value].Add(mn);
+        }
+        foreach (var kv in addrMap) NotePoint(kv.Value);
+        foreach (var nm in order) NotePoint(xmlTags[nm].GetValueOrDefault("POINT_ASSIGNMENT.PhysicalAddress", ""));
+
+        // The XML sometimes repeats a PhysicalAddress (or leaves aliases resolved to the same
+        // point). TriStation reallocates the later tag instead of failing with TN0090, so make
+        // every address unique within its class before writing the table. Alias entries keep
+        // their shared address.
+        {
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var nextByPrefix = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var nm in order)
+            {
+                var fl = xmlTags[nm];
+                if (!fl.GetValueOrDefault("POINT_ASSIGNMENT.AliasCategory", "").Equals("NO_ALIAS", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!addrMap.TryGetValue(nm, out var addr) || string.IsNullOrEmpty(addr)) continue;
+                if (used.Add(addr)) { continue; }
+                int dot = addr.IndexOf('.');
+                string prefix = dot > 0 ? addr.Substring(0, dot) : addr;
+                if (!nextByPrefix.TryGetValue(prefix, out int next))
+                {
+                    next = 1;
+                    foreach (var u in used)
+                    {
+                        if (!u.StartsWith(prefix + ".", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (int.TryParse(u.Substring(prefix.Length + 1), out int num) && num >= next) next = num + 1;
+                    }
+                }
+                string candidate;
+                do { candidate = prefix + "." + next.ToString("0000"); next++; } while (!used.Add(candidate));
+                nextByPrefix[prefix] = next;
+                addrMap[nm] = candidate;
+            }
+        }
+
+        // Template/placeholder tags (names containing XXX) are not real points. TriStation's
+        // importer stores them as unaliased BOOL memory tags at one shared dummy MBN address;
+        // keeping their exported point type/alias makes the tag validator reject them (TN0026).
+        int placeholderMbn = 0;
+        foreach (var v in addrMap.Values)
+        {
+            var mm = Regex.Match(v ?? "", @"^MBN\.(\d+)$");
+            if (mm.Success && int.TryParse(mm.Groups[1].Value, out int n) && n > placeholderMbn) placeholderMbn = n;
+        }
+        string placeholderAddr = "MBN." + (placeholderMbn + 1).ToString("0000");
+        int rehomedMbn = placeholderMbn;
+        var usedFinal = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         var sb = new StringBuilder();
         sb.Append(Regex.Replace(lines[0], "NumberOfTags =\\d+", "NumberOfTags =" + xmlTags.Count)).Append("\r\n");
@@ -107,6 +196,148 @@ public static class TagGen
                 if (addrField >= 0) fields[addrField] = assigned;
                 if (physField >= 0) fields[physField] = DerivePhysicalAddress(
                     assigned, flat.GetValueOrDefault("POINT_ASSIGNMENT.BinNumber", ""));
+            }
+
+            string pointType = flat.GetValueOrDefault("POINT_ASSIGNMENT.PointType", "");
+            string aliasNum = flat.GetValueOrDefault("POINT_ASSIGNMENT.AliasNumber", "0");
+            string aliasCat = flat.GetValueOrDefault("POINT_ASSIGNMENT.AliasCategory", "");
+            string aliasType = flat.GetValueOrDefault("POINT_ASSIGNMENT.AliasType", "");
+            // A template/placeholder tag carries no address, no alias number and (by TriStation's
+            // naming convention) an "XXX" name, and is exported as a memory tag that still claims
+            // an INPUT/OUTPUT point with NO_ALIAS. TriStation stores those as plain unaliased BOOL
+            // memory tags; keeping the exported point type makes the address validator reject them
+            // (TN0026/TN0116). Aliased XXX tags (DEFAULT_ALIAS/USER_ALIAS or PointType=MEMORY) are
+            // real points and are handled by the alias allocator below.
+            bool isPlaceholder =
+                name.IndexOf("XXX", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                flat.GetValueOrDefault("POINT_ASSIGNMENT.PhysicalAddress", "").Length == 0 &&
+                (aliasNum.Length == 0 || aliasNum == "0") &&
+                aliasCat.Equals("NO_ALIAS", StringComparison.OrdinalIgnoreCase) &&
+                (pointType.Equals("INPUT", StringComparison.OrdinalIgnoreCase) ||
+                 pointType.Equals("OUTPUT", StringComparison.OrdinalIgnoreCase));
+            bool autoAlias = !isPlaceholder &&
+                (aliasNum.Length == 0 || aliasNum == "0") &&
+                !aliasType.Equals("UNALIASED", StringComparison.OrdinalIgnoreCase);
+            if (autoAlias)
+            {
+                void Set(string col, string value)
+                {
+                    int ci = Col(cols, col);
+                    if (ci >= 0) fields[ci] = value;
+                }
+                bool readWrite = aliasType.Equals("READWRITE_ALIASED", StringComparison.OrdinalIgnoreCase);
+                bool isBool = flat.GetValueOrDefault("@type", "").Equals("BOOL", StringComparison.OrdinalIgnoreCase);
+                string prefix = (readWrite, isBool) switch
+                {
+                    (false, true) => "MBR",
+                    (false, false) => "MIR",
+                    (true, true) => "MBW",
+                    _ => "MIW",
+                };
+                var used = usedAliasPoints[prefix];
+                int idx = 1;
+                while (used.Contains(idx)) idx++;
+                used.Add(idx);
+                int legacyBase = (readWrite, isBool) switch
+                {
+                    (false, true) => 12000,
+                    (false, false) => 31000,
+                    (true, true) => 2000,
+                    _ => 40250,
+                };
+                int extendedBase = (readWrite, isBool) switch
+                {
+                    (false, true) => 120000,
+                    (false, false) => 320000,
+                    (true, true) => 20000,
+                    _ => 415000,
+                };
+                string legacy = (legacyBase + idx).ToString(CultureInfo.InvariantCulture);
+                string extended = (extendedBase + idx).ToString(CultureInfo.InvariantCulture);
+                string address = prefix + "." + idx.ToString("0000");
+                usedAliasNumbers.Add(legacyBase + idx);
+                Set("AliasNumberSelection", "1");
+                Set("UserAliasLegacy", legacy);
+                Set("UserAliasExtended", extended);
+                Set("AliasType", readWrite ? "3" : "2");
+                Set("Location", "1");
+                Set("IsMemory", "True");
+                if (addrField >= 0) fields[addrField] = address;
+                if (physField >= 0) fields[physField] = address;
+            }
+            if (isPlaceholder)
+            {
+                void Set(string col, string value)
+                {
+                    int ci = Col(cols, col);
+                    if (ci >= 0) fields[ci] = value;
+                }
+                Set("DataType", "BOOL");
+                Set("AliasType", "1");
+                Set("AliasNumberSelection", "0");
+                Set("UserAliasLegacy", "0");
+                Set("UserAliasExtended", "0");
+                Set("IsMemory", "True");
+                Set("IsInput", "False");
+                Set("IsOutput", "False");
+                Set("Location", "1");
+                Set("IsSafety", "False");
+                Set("IsControl", "True");
+                Set("Group1", "");
+                Set("Group2", "");
+                if (addrField >= 0) fields[addrField] = "MBN." + (++rehomedMbn).ToString("0000");
+                if (physField >= 0) fields[physField] = "MBN." + rehomedMbn.ToString("0000");
+            }
+
+            // Final duplicate guard: addresses copied straight from the XML are not in addrMap,
+            // so enforce uniqueness on the values actually written.
+            if (addrField >= 0)
+            {
+                string a = fields[addrField];
+                if (a.Length > 0 && !usedFinal.Add(a))
+                {
+                    int dot = a.IndexOf('.');
+                    string prefix = dot > 0 ? a.Substring(0, dot) : a;
+                    int next = 1;
+                    foreach (var u in usedFinal)
+                        if (u.StartsWith(prefix + ".", StringComparison.OrdinalIgnoreCase)
+                            && int.TryParse(u.Substring(prefix.Length + 1), out int num) && num >= next)
+                            next = num + 1;
+                    string candidate;
+                    do { candidate = prefix + "." + next.ToString("0000"); next++; } while (!usedFinal.Add(candidate));
+                    fields[addrField] = candidate;
+                }
+                // Keep the derived physical address. For an aliased tag it is the alias target
+                // (e.g. IIR.0021) while Address stays the point coordinate (02.06.21); forcing the
+                // two to agree makes TriStation report the tag as unallocated (PC0117) and its
+                // memory as overlapping (PB0002/PB0003). For a plain point both derive the same.
+                if (physField >= 0 && fields[addrField].Length > 0)
+                {
+                    bool aliased = !flat.GetValueOrDefault("POINT_ASSIGNMENT.AliasCategory", "")
+                        .Equals("NO_ALIAS", StringComparison.OrdinalIgnoreCase);
+                    fields[physField] = aliased
+                        ? fields[physField]
+                        : DerivePhysicalAddress(fields[addrField], flat.GetValueOrDefault("POINT_ASSIGNMENT.BinNumber", ""));
+                    if (fields[physField].Length == 0) fields[physField] = fields[addrField];
+                }
+            }
+
+            // Opt-in repair for lossy exports: a tag provably written by more than one program
+            // needs multiple writes enabled or the compiler stops with PC0005.
+            if (forceMultiWrite != null && forceMultiWrite.Contains(name))
+            {
+                int ci = Col(cols, "EnableMultipleWrites");
+                if (ci >= 0) fields[ci] = "True";
+            }
+
+            // Programs that reference this tag. TriStation stores them in reverse program
+            // order and uses this list to allocate the tag to the compiled application;
+            // a missing entry leaves the tag unallocated (PC0117) or elements disconnected.
+            int plField = Col(cols, "ProgramsList");
+            if (plField >= 0)
+            {
+                var owners = tagPrograms.TryGetValue(name, out var list) ? list : new List<string>();
+                fields[plField] = owners.Count == 0 ? "{}" : "{" + string.Join(",", owners) + "}";
             }
 
             sb.Append(string.Join(",", fields.Select(Q))).Append("\r\n");
@@ -164,7 +395,7 @@ public static class TagGen
     }
 
     private static readonly HashSet<string> HwColumns = new(StringComparer.OrdinalIgnoreCase)
-    { "Group1", "Group2", "IOModuleConfig", "IOModuleTrigger", "AI_Unit" };
+    { "IOModuleConfig", "IOModuleTrigger", "AI_Unit" };
 
     /// <summary>The template's own Address per tag - the target project's existing assignment.</summary>
     private static Dictionary<string, string> TemplateAddresses(
@@ -175,6 +406,21 @@ public static class TagGen
         if (ac < 0) return d;
         foreach (var kv in tmpl)
             if (ac < kv.Value.Count && kv.Value[ac].Length > 0) d[kv.Key] = kv.Value[ac];
+        return d;
+    }
+
+    /// <summary>Template tag names to their declared data type. A template address may only be
+    /// reused for a tag of the same type: the scaffold project can contain an unrelated tag that
+    /// happens to share a name (e.g. a DINT "Temp1" while the XML declares a BOOL "Temp1"), and
+    /// keeping its address would hand a BOOL tag a word address (TN0116).</summary>
+    private static Dictionary<string, string> TemplateTypes(
+        Dictionary<string, List<string>> tmpl, List<string> cols)
+    {
+        var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        int tc = Col(cols, "DataType");
+        if (tc < 0) return d;
+        foreach (var kv in tmpl)
+            if (tc < kv.Value.Count && kv.Value[tc].Length > 0) d[kv.Key] = kv.Value[tc];
         return d;
     }
 
@@ -193,9 +439,12 @@ public static class TagGen
         A("UserAliasExtended", "POINT_ASSIGNMENT.AliasNumberExt", Tx.Ident);
         A("AliasNumberSelection", "POINT_ASSIGNMENT.AliasCategory", Tx.AliasSel);
         A("Description", "@documentation", Tx.Ident);
+        // Group1/Group2 are the plant/unit grouping the source export carries.
+        A("Group1", "TAG_DECLARATION.Group1", Tx.Ident);
+        A("Group2", "TAG_DECLARATION.Group2", Tx.Ident);
         A("InitialValue", "@initial", Tx.Ident);
         A("IsSafety", "TAG_DECLARATION.Application", Tx.AppSafety);
-        // IsControl: no reliable XML source (template is always False) -> reported MISSING
+        A("IsControl", "TAG_DECLARATION.Application", Tx.AppControl);
         A("SharedRead", "TAG_DECLARATION.SharedForRead", Tx.YesNo);
         A("IsMemory", "POINT_ASSIGNMENT.PointType", Tx.Mem);
         A("IsInput", "POINT_ASSIGNMENT.PointType", Tx.PointInput);
@@ -237,8 +486,8 @@ public static class TagGen
         A("HART_LockConfiguration", "HART_PARAMS.LockConfig", Tx.Bool);
         A("Class", "POINT_ASSIGNMENT.TagClass", Tx.ClassEnum);
         A("SOEFlags", "SOE_BLOCKS_ASSIGNMENT.#text", Tx.Ident);
-        A("PI_PointType", "PI_PARAMS.PIPointType", Tx.Ident);
-        A("PI_PointGearTeeth", "PI_PARAMS.GearTeeth", Tx.Ident);
+        A("PI_PointType", "PI_PARAMS.PIPointType", Tx.Pad2);
+        A("PI_PointGearTeeth", "PI_PARAMS.GearTeeth", Tx.Pad2);
         A("PI_PointGearRatio", "PI_PARAMS.GearRatio", Tx.F6);
         return d;
     }
@@ -271,11 +520,12 @@ public static class TagGen
     /// </summary>
     public static Dictionary<string, string> AssignAddresses(
         IReadOnlyList<(string Name, string Pa, string DataType)> ordered, AddrMode mode,
-        IReadOnlyDictionary<string, string>? templateAddr = null)
+        IReadOnlyDictionary<string, string>? templateAddr = null,
+        IReadOnlyDictionary<string, string>? templateType = null)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        int mbn = 0, min = 0;
+        int mbn = 0, min = 0, mrn = 0;
         foreach (var t in ordered)
         {
             string pa = t.Pa ?? "";
@@ -288,21 +538,33 @@ public static class TagGen
                 addr = pa;
                 seen.Add(pa);
             }
-            else if (templateAddr != null && templateAddr.TryGetValue(t.Name, out var ta) && ta.Length > 0)
+            else if (templateAddr != null && templateAddr.TryGetValue(t.Name, out var ta) && ta.Length > 0 &&
+                     (templateType == null || !templateType.TryGetValue(t.Name, out var tt) ||
+                      string.Equals(tt, t.DataType, StringComparison.OrdinalIgnoreCase)))
                 addr = ta;   // target project already has this tag: keep its assignment
-            else addr = Allocate(t.DataType, ref mbn, ref min);
+            else addr = Allocate(t.DataType, ref mbn, ref min, ref mrn);
             map[t.Name] = addr;
         }
         return map;
     }
 
-    /// <summary>Fresh address for an un-addressed tag: BOOL -> MBN, numeric -> MIN.</summary>
+    /// <summary>Fresh address for an un-addressed tag: BOOL -> MBN, REAL -> MRN, other numeric ->
+    /// MIN. TriStation keeps the three memory classes separate; a REAL tag parked in MIN is
+    /// reported as a corrupted address (TN0116).</summary>
+    public static string Allocate(string dataType, ref int mbn, ref int min, ref int mrn)
+    {
+        if (string.Equals(dataType, "BOOL", StringComparison.OrdinalIgnoreCase))
+            return "MBN." + (++mbn).ToString("0000", CultureInfo.InvariantCulture);
+        if (string.Equals(dataType, "REAL", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(dataType, "LREAL", StringComparison.OrdinalIgnoreCase))
+            return "MRN." + (++mrn).ToString("0000", CultureInfo.InvariantCulture);
+        return "MIN." + (++min).ToString("0000", CultureInfo.InvariantCulture);
+    }
+
     public static string Allocate(string dataType, ref int mbn, ref int min)
     {
-        bool isBool = string.Equals(dataType, "BOOL", StringComparison.OrdinalIgnoreCase);
-        return isBool
-            ? "MBN." + (++mbn).ToString("0000", CultureInfo.InvariantCulture)
-            : "MIN." + (++min).ToString("0000", CultureInfo.InvariantCulture);
+        int unused = 0;
+        return Allocate(dataType, ref mbn, ref min, ref unused);
     }
 
     // The Tagnames.csv PhysicalAddress column is NOT the same quantity as Address:
@@ -324,7 +586,7 @@ public static class TagGen
         return addr;
     }
 
-    private enum Tx { Ident, YesNo, Bool, Color, IoModule, Filter, ClassEnum, AppSafety, AppControl, Mem, PointInput, PointOutput, PointLocation, AliasType, AliasSel, F6 }
+    private enum Tx { Ident, YesNo, Bool, Color, IoModule, Filter, ClassEnum, AppSafety, AppControl, Mem, PointInput, PointOutput, PointLocation, AliasType, AliasSel, Pad2, F6 }
 
     private static string Transform(Tx t, string v) => t switch
     {
@@ -353,11 +615,16 @@ public static class TagGen
                       : v.Equals("USER_ALIAS", StringComparison.OrdinalIgnoreCase) ? "2" : "1",
         Tx.F6 => double.TryParse(v, NumberStyles.Any, CultureInfo.InvariantCulture, out var d)
                  ? Math.Round(d, 3).ToString("F6", CultureInfo.InvariantCulture) : v,
+        // TriStation stores the pulse-input parameters as two-digit codes ("00", "01"); a bare
+        // "0"/"1" makes tag validation fail with TN0141 "Invalid PI parameter".
+        Tx.Pad2 => int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)
+                 ? n.ToString("00", CultureInfo.InvariantCulture) : v,
         _ => v,
     };
 
     // ---- shared helpers ----
-    private static string Q(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
+    private static string Q(string s)
+        => "\"" + (s ?? "").Replace("\r", " ").Replace("\n", " ").Replace("\"", "\"\"") + "\"";
 
     private static bool Eq(string csv, string got)
     {
@@ -372,6 +639,38 @@ public static class TagGen
     {
         for (int i = 0; i < cols.Count; i++) if (cols[i].Equals(name, StringComparison.OrdinalIgnoreCase)) return i;
         return -1;
+    }
+
+    /// <summary>Tag name â†’ programs whose globalVars reference it, in reverse XML program order
+    /// (the order TriStation writes into Tagnames.csv's ProgramsList column).</summary>
+    private static Dictionary<string, List<string>> ParseProgramUsage(string xmlPath)
+    {
+        string t = File.ReadAllText(xmlPath);
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match p in Regex.Matches(t, "(?s)<pou\\s+name=\"([^\"]+)\"[^>]*pouType=\"program\"[^>]*>(.*?)</pou>"))
+        {
+            string program = p.Groups[1].Value;
+            var gv = Regex.Match(p.Groups[2].Value, "(?s)<globalVars[^>]*>(.*?)</globalVars>");
+            if (!gv.Success) continue;
+            foreach (Match v in Regex.Matches(gv.Groups[1].Value, "<variable\\s+name=\"([^\"]+)\""))
+            {
+                string tag = v.Groups[1].Value;
+                if (!result.TryGetValue(tag, out var list)) result[tag] = list = new List<string>();
+                if (!list.Contains(program)) list.Add(program);
+            }
+        }
+        foreach (var list in result.Values) list.Reverse();
+        return result;
+    }
+
+    /// <summary>Declared type and description for every tag in the XML's &lt;ts:TAGNAME&gt;
+    /// blocks (name → type/desc), used by the FBD generator for global declarations.</summary>
+    public static Dictionary<string, (string Type, string Desc)> TagTypes(string xmlPath)
+    {
+        var d = new Dictionary<string, (string Type, string Desc)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in ParseXmlTags(xmlPath))
+            d[kv.Key] = (kv.Value.GetValueOrDefault("@type", ""), kv.Value.GetValueOrDefault("@documentation", ""));
+        return d;
     }
 
     private static Dictionary<string, Dictionary<string, string>> ParseXmlTags(string xmlPath)

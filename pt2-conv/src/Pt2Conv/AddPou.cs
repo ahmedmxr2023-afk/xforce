@@ -136,7 +136,10 @@ public static class AddPou
             new XAttribute("Flags", isProgram ? "1083423" : (st ? "1048607" : "1050655")),
             new XAttribute("PPDFlags", "0"),
             new XAttribute("EMOCRC32", "0"),
-            new XAttribute("ExtOptionFlags", "2"),
+            // Matches the FBD document header we write and the shape TriStation itself gives a
+            // regenerated element: 3 = FBD function block with logic, 513 = FBD program,
+            // 2 = ST / faceplate-only element.
+            new XAttribute("ExtOptionFlags", st ? "2" : (isProgram ? "513" : "3")),
             new XAttribute("CemEventInputs", "0"),
             new XAttribute("CemActionOutputs", "0"));
         string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);

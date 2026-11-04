@@ -74,6 +74,22 @@ export function engineToken(): string | null {
 }
 
 /**
+ * Optional bootstrap administrator, created on every cold start when the account
+ * is missing.
+ *
+ * Hosts without a persistent disk lose the database on redeploy, which would
+ * also lose the only admin account. Setting BOOTSTRAP_ADMIN_EMAIL and
+ * BOOTSTRAP_ADMIN_PASSWORD recreates it on boot. Existing accounts are never
+ * rewritten beyond their role, so a password changed in the UI stays changed.
+ */
+export function bootstrapAdmin(): { email: string; password: string } | null {
+  const email = read("BOOTSTRAP_ADMIN_EMAIL")?.toLowerCase();
+  const password = read("BOOTSTRAP_ADMIN_PASSWORD");
+  if (!email || !password) return null;
+  return { email, password };
+}
+
+/**
  * Shared secret that unlocks the mock payment provider.
  *
  * Checkout is refused unless this is set, and the request must echo the same

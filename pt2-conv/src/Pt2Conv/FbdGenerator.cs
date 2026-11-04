@@ -25,8 +25,8 @@ public static partial class FbdGenerator
 
     public sealed class LibPin
     {
-        public string Name = "", DataType = "", InitVal = "";
-        public int Vt, Flags;
+        public string Name = "", DataType = "", InitVal = "", Desc = "";
+        public int Vt, Flags, RefCount, FbRefCount;
     }
 
     private sealed class LibMeta
@@ -39,10 +39,15 @@ public static partial class FbdGenerator
 
     /// <summary>Snapshot data for a POU defined by the project itself (a function block that
     /// another POU instantiates). TriStation resolves such a block from the catalogue entry and
-    /// the FB's own interface, not from the platform library.</summary>
+    /// the FB's own interface, not from the platform library.
+    ///
+    /// The identity has to be the *live* catalogue identity of the element: its DogTag plus the
+    /// eventId of its EventConnectionsChanged record. A reference written against eventId 0 (or
+    /// a DogTag of 0) is not resolvable, and the editor draws the instance as an unknown block
+    /// with a red cross over it.</summary>
     public sealed class ProjectTypeInfo
     {
-        public int DogTag, ElemType = 2, SubType = 6, ExtOptFlags = 2, CemEI, CemAO, EventId, User = 2;
+        public int DogTag, ElemType = 2, SubType = 0, ExtOptFlags = 2, CemEI, CemAO, EventId, User = 1;
         public string Date = "";
         public List<LibPin> Pins = new();
     }
@@ -55,7 +60,7 @@ public static partial class FbdGenerator
         var info = new ProjectTypeInfo();
         foreach (var v in p.Vars)
         {
-            int vt = v.Section switch
+            int vt = v.IsInstance ? 3 : v.Section switch
             {
                 "output" => 1,
                 "inOut" => 3,
@@ -63,13 +68,20 @@ public static partial class FbdGenerator
                 "input" => 0,
                 _ => 5,
             };
+            int refCount = v.IsInstance
+                ? p.Blocks.Count(b => b.InstanceName == v.Name)
+                : p.Placements.Count(x => x.Expression == v.Name);
+            int flags = v.IsInstance ? (Lib.ContainsKey(v.Derived) ? 100663298 : 33554434) : 0;
             info.Pins.Add(new LibPin
             {
                 Name = v.Name,
                 DataType = v.IsInstance ? v.Derived : v.DataType,
                 InitVal = v.InitVal,
+                Desc = v.Doc,
                 Vt = vt,
-                Flags = v.IsInstance ? 33554434 : 0,
+                Flags = flags,
+                RefCount = refCount,
+                FbRefCount = v.IsInstance ? refCount : 0,
             });
         }
         return info;
@@ -95,7 +107,6 @@ public static partial class FbdGenerator
             using var doc = System.Text.Json.JsonDocument.Parse(reader.ReadToEnd());
             foreach (var entry in doc.RootElement.EnumerateObject())
             {
-                if (Lib.ContainsKey(entry.Name)) continue;
                 var v = entry.Value;
                 var meta = new LibMeta
                 {
@@ -118,6 +129,9 @@ public static partial class FbdGenerator
                         Vt = pin.GetProperty("vt").GetInt32(),
                         Flags = pin.GetProperty("flags").GetInt32(),
                     });
+                // The resource is a capture of the *installed* library, so it supersedes the
+                // built-in table (which mirrors the older library the embedded base was made
+                // with); stale dogTags here are reported by TriStation as out-of-date elements.
                 Lib[entry.Name] = meta;
             }
         }
@@ -534,6 +548,7 @@ public static partial class FbdGenerator
         public string SrcPin = "";
         public ExElem? Owner;
         public string OwnerPin = "";
+        public bool FeedBack;
         public List<(int X, int Y)> Path = new();
     }
 
@@ -543,6 +558,8 @@ public static partial class FbdGenerator
         public int W, H;
         public ExConn? InConn;
         public bool IsConstant;
+        public ExElem? DirectInSource;
+        public string DirectInPin = "";
         public string DataType = "";
         public string Annotation = "%DESCRIPTION", Annotate = "TRUE", MonitorValue = "FALSE";
     }
@@ -610,6 +627,7 @@ public static partial class FbdGenerator
         // A zero-length connection from a real (non-literal) variable is silently dropped by
         // the importer: the pin stays bare and the variable gets no outConnection.
         public bool Drop;
+        public bool FeedBack;
         public Wire? Parent;
         public int Vn;
         public List<(int X, int Y)> PathExport = new();
@@ -661,6 +679,7 @@ public static partial class FbdGenerator
     private static string TextTrim(XElement? e)
     {
         if (e == null) return "";
+        // XCData derives from XText, so this also picks up <![CDATA[…]]> content.
         var t = e.Nodes().OfType<XText>().Select(t => t.Value).FirstOrDefault() ?? "";
         return t.Trim();
     }
@@ -670,13 +689,17 @@ public static partial class FbdGenerator
         var doc = XmlRepair.Load(xmlPath);
         var pou = doc.Descendants().FirstOrDefault(
             e => e.Name.LocalName == "pou" && A(e, "name") == pouName)
+            ?? doc.Descendants().FirstOrDefault(
+                e => e.Name.LocalName == "pou" && string.Equals(A(e, "name"), pouName, StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidOperationException($"POU '{pouName}' not found in {xmlPath}");
 
         var p = new ExPou { Name = pouName, PouType = A(pou, "pouType", "functionBlock").ToLowerInvariant(), TagDesc = tagDesc };
-        p.IsBuilt = referencedTypes == null || referencedTypes.Contains(pouName);
-        // TriStation writes function blocks at the current FBD schema version (1.1),
-        // regardless of the XML's declared version; programs keep the exported version.
-        p.Version = p.PouType == "functionblock" ? "1.1" : A(pou, "version", "1.0");
+        p.IsBuilt = referencedTypes == null ||
+                    referencedTypes.Contains(pouName) ||
+                    referencedTypes.Any(r => string.Equals(r, pouName, StringComparison.OrdinalIgnoreCase));
+        // TriStation's import resets the POU version: function blocks are written at the current
+        // FBD schema version (1.1), programs at 1.0, regardless of the XML's declared revision.
+        p.Version = p.PouType == "functionblock" ? "1.1" : "1.0";
 
         var iface = pou.Elements().FirstOrDefault(e => e.Name.LocalName == "interface");
         if (iface != null)
@@ -821,6 +844,13 @@ public static partial class FbdGenerator
                 var itemExt = el.Elements().FirstOrDefault(e => e.Name.LocalName == "FBDITEM_EXT");
                 var dtEl = itemExt?.Elements().FirstOrDefault(e => e.Name.LocalName == "DATATYPE");
                 if (dtEl != null) v.DataType = TextTrim(dtEl);
+                // Fall back to the declared type: the export does not always carry DATATYPE on the
+                // placement, and the compiler temp type is derived from the operand's type.
+                if (v.DataType.Length == 0)
+                {
+                    var decl = p.Vars.FirstOrDefault(x => x.Name.Equals(v.Expression, StringComparison.OrdinalIgnoreCase));
+                    if (decl != null) v.DataType = decl.IsInstance ? decl.Derived : decl.DataType;
+                }
                 var annText = itemExt?.Elements().FirstOrDefault(e => e.Name.LocalName == "TEXT");
                 if (annText != null) v.Annotation = TextTrim(annText);
                 var annFlag = itemExt?.Elements().FirstOrDefault(e => e.Name.LocalName == "ANNOTATE");
@@ -933,6 +963,7 @@ public static partial class FbdGenerator
         {
             SrcExportId = int.Parse(A(connEl, "refLocalId", "-1")),
             SrcPin = A(connEl, "formalParameter"),
+            FeedBack = A(connEl, "FeedBack", "false").Equals("true", StringComparison.OrdinalIgnoreCase),
         };
         foreach (var pos in connEl.Elements().Where(e => e.Name.LocalName == "position"))
             c.Path.Add((int.Parse(A(pos, "x", "0")), int.Parse(A(pos, "y", "0"))));
@@ -954,6 +985,13 @@ public static partial class FbdGenerator
         public int LastId;
         public int PrimarySpan;
         public int WireIdStart;
+        /// <summary>The ST listing TriStation stores beside an FBD element (<c>.IST</c>). Built while
+        /// the layout is computed; it is also the source of the compiler temp variables that a
+        /// caller's block snapshot has to declare.</summary>
+        public List<string>? Listing;
+        /// <summary>Project-defined function blocks (identity + interface) so instances of them
+        /// can be wired to a real snapshot event instead of the unknown-type fallback.</summary>
+        public IReadOnlyDictionary<string, ProjectTypeInfo>? ProjectTypes;
     }
 
     private static int TargetPriority(ExPou p, Wire w)
@@ -1274,6 +1312,79 @@ public static partial class FbdGenerator
         return chains;
     }
 
+    /// <summary>Repairs placement/block wire references that still point at wires removed by
+    /// <see cref="DecomposeNets"/>. A decomposed net replaces the export's per-connection wires
+    /// with chains; when a pin sits on a geometric junction the chain remap skips it, leaving the
+    /// emitted element with a <c>connectId</c> for a wire that is not written. TriStation then
+    /// reports the element as unconnected (WG0012) and rewrites it into a broken link variable.
+    /// Re-emit a plain wire for each such dangling reference.</summary>
+    private static void RepairWireRefs(Plan plan)
+    {
+        var live = new HashSet<Wire>(plan.Wires);
+        var added = new Dictionary<string, Wire>(StringComparer.Ordinal);
+
+        Wire? AddWire(Wire stale, ExElem? target, string targetPin, ExElem? source, string sourcePin, bool targetIsVar, bool sourceIsVar)
+        {
+            if (source == null || target == null) return null;
+            string key = $"{elementIdOf(plan, source)}.{sourcePin}->{elementIdOf(plan, target)}.{targetPin}";
+            if (added.TryGetValue(key, out var existing)) return existing;
+            added[key] = null!;
+            var path = new List<(int X, int Y)>();
+            var raw = stale.RawPath.Count >= 2 ? stale.RawPath : stale.PathExport;
+            if (raw.Count >= 2) { path.Add(raw[0]); path.Add(raw[^1]); }
+            if (path.Count == 0) path.AddRange(stale.PathExport);
+            var w = new Wire
+            {
+                Source = source, SourcePin = sourcePin,
+                Target = target, TargetPin = targetPin,
+                SourceVar = sourceIsVar ? source as ExVarPlace : null,
+                TargetVar = targetIsVar ? target as ExVarPlace : null,
+                SourceBlock = sourceIsVar ? null : source as ExBlock,
+                TargetBlock = targetIsVar ? null : target as ExBlock,
+                PathExport = path,
+                TargetIsBlockInput = !targetIsVar,
+            };
+            plan.Wires.Add(w);
+            live.Add(w);
+            added[key] = w;
+            if (target is ExVarPlace tv && plan.Places.TryGetValue(tv, out var tp)) tp.InWire = w;
+            if (source is ExVarPlace sv && plan.Places.TryGetValue(sv, out var sp)) sp.OutWire = w;
+            return w;
+        }
+
+        foreach (var pp in plan.Places.Values)
+        {
+            if (pp.InWire != null && !live.Contains(pp.InWire))
+            {
+                var w = AddWire(pp.InWire, pp.P, pp.InWire.TargetPin, pp.InWire.Source, pp.InWire.SourcePin, true, pp.InWire.SourceVar != null);
+                pp.InWire = w;
+            }
+            if (pp.OutWire != null && !live.Contains(pp.OutWire))
+            {
+                var w = AddWire(pp.OutWire, pp.OutWire.Target, pp.OutWire.TargetPin, pp.P, pp.OutWire.SourcePin, pp.OutWire.TargetVar != null, true);
+                pp.OutWire = w;
+            }
+        }
+        foreach (var bp in plan.Blocks)
+        {
+            foreach (var pin in bp.OutWires.Keys.ToList())
+            {
+                var w = bp.OutWires[pin];
+                if (live.Contains(w)) continue;
+                var repl = AddWire(w, w.Target, w.TargetPin, bp.B, pin, w.TargetVar != null, false);
+                if (repl != null) bp.OutWires[pin] = repl; else bp.OutWires.Remove(pin);
+            }
+            for (int i = 0; i < bp.InWires.Count; i++)
+            {
+                var w = bp.InWires[i];
+                if (w == null || live.Contains(w)) continue;
+                if (i >= bp.B.Inputs.Count) { bp.InWires[i] = null; continue; }
+                string pin = bp.B.Inputs[i].Name;
+                bp.InWires[i] = AddWire(w, bp.B, pin, w.Source, w.SourcePin, false, w.SourceVar != null);
+            }
+        }
+    }
+
     /// <summary>
     /// Assigns wire ids after the final geometry is known: per sheet, in plan order, a wire
     /// consumes one id per path segment and keeps the last one (TriStation's edit-history
@@ -1352,35 +1463,47 @@ public static partial class FbdGenerator
             if (src == null) continue;
             var tgt = c.Owner!;
             if (src.Clipped || tgt.Clipped) continue;
-            var w = new Wire { Source = src, Target = tgt, PathExport = new List<(int, int)>(c.Path) };
+            string srcPin = c.SrcPin, ownerPin = c.OwnerPin;
+            var w = new Wire { Source = src, Target = tgt, FeedBack = c.FeedBack, PathExport = new List<(int, int)>(c.Path) };
             w.RawPath = new List<(int X, int Y)>(c.Path);
             if (src is ExVarPlace sv) { w.SourceVar = sv; w.SourcePin = sv.Expression; }
             else if (src is ExBlock sb)
             {
                 w.SourceBlock = sb;
-                w.SourcePin = c.SrcPin.Length > 0 ? c.SrcPin
+                w.SourcePin = srcPin.Length > 0 ? srcPin
                     : (sb.Outputs.Count > 0 ? sb.Outputs[0].Name : "");
             }
             if (tgt is ExVarPlace tv) { w.TargetVar = tv; w.TargetPin = tv.Expression; }
-            else if (tgt is ExBlock tb) { w.TargetBlock = tb; w.TargetPin = c.OwnerPin; w.TargetIsBlockInput = true; }
+            else if (tgt is ExBlock tb) { w.TargetBlock = tb; w.TargetPin = ownerPin; w.TargetIsBlockInput = true; }
             bool degenerate = c.Path.Count >= 1 && c.Path.All(pp => pp == c.Path[0]);
-            // A literal placement is never joined to the logic with a wire object: the
-            // editor stores it as a direct pin connection (the variable carries
-            // outConnectId and the target pin carries connectId). Only real variables get
-            // wire objects. A zero-length connection is stored the same way.
-            bool srcDrop = (w.SourceVar != null && w.SourceVar.IsConstant) || degenerate;
+            // A literal that feeds a block input is joined by a normal wire (TriStation stores a
+            // CDGMWireXml between the CONSTANT out-variable and the pin). A literal that feeds a
+            // plain variable keeps the direct pin link only; wiring that shape is rejected by the
+            // compiler as "Feature not implemented".
+            bool constToBlock = w.SourceVar != null && w.SourceVar.IsConstant && w.TargetIsBlockInput;
+            bool srcDrop = (w.SourceVar != null && w.SourceVar.IsConstant && !constToBlock) || degenerate;
             bool tgtDrop = w.TargetVar != null && w.TargetVar.IsConstant && w.TargetVar.Kind != "in";
             if (srcDrop || tgtDrop) w.Suppress = true;
             if (degenerate && (w.SourceVar == null || !w.SourceVar.IsConstant)) w.Drop = true;
+            // A zero-length link is stored as a direct pin link on the destination
+            // (inConnection = source pin/name, inConnectId = source element), not as a wire.
+            // Without it the destination is reported as an unconnected element.
+            if (degenerate && w.TargetVar != null)
+            {
+                if (w.SourceVar != null && !w.SourceVar.IsConstant)
+                {
+                    w.TargetVar.DirectInSource = w.SourceVar;
+                    w.TargetVar.DirectInPin = w.SourceVar.Expression;
+                }
+                else if (w.SourceBlock != null && w.SourcePin.Length > 0)
+                {
+                    w.TargetVar.DirectInSource = w.SourceBlock;
+                    w.TargetVar.DirectInPin = w.SourcePin;
+                }
+            }
             plan.Wires.Add(w);
             connWire[c] = w;
         }
-
-        // 1b. rebuild merge nets the way the editor stores them (junctions + collinear arms).
-        // Disabled: the single-junction/collinear-pair rule fixed CHANGEOVER geometry but
-        // over-merged ~10 AI_COND nets (good keeps those arms separate), so it is not yet
-        // reliable. Keep the export's per-connection wires until the rule is exact.
-        // DecomposeNets(plan);
 
         // A zero-length outgoing connection from a variable that is itself a sink is dropped
         // by the importer; one from a pure source is kept as a direct pin link.
@@ -1524,14 +1647,25 @@ public static partial class FbdGenerator
         foreach (var bp in blocks)
         {
             bp.OutWires.Clear();
-            foreach (var pin in bp.B.Outputs)
+            for (int oi = 0; oi < bp.B.Outputs.Count; oi++)
             {
-                var w = plan.Wires.FirstOrDefault(x => x.SourceBlock == bp.B && x.SourcePin == pin.Name && !x.IsBranch && !x.Suppress);
+                var pin = bp.B.Outputs[oi];
+                // The XML names pins positionally ("OUT_17"); the connection's formalParameter
+                // carries the library pin name. Try both so a pin is never left unwired.
+                string pn = PortName(bp.B, false, oi, pin.Name);
+                var w = plan.Wires.Where(x => ReferenceEquals(x.SourceBlock, bp.B) && !x.Suppress
+                                              && (x.SourcePin == pn || x.SourcePin == pin.Name))
+                                   .OrderBy(x => x.IsBranch ? 1 : 0).FirstOrDefault();
                 if (w != null) bp.OutWires[pin.Name] = w;
             }
-            bp.InWires = bp.B.Inputs
-                .Select(pin => plan.Wires.FirstOrDefault(x => x.TargetBlock == bp.B && x.TargetPin == pin.Name))
-                .ToList();
+            bp.InWires = new List<Wire?>();
+            for (int i = 0; i < bp.B.Inputs.Count; i++)
+            {
+                var pin = bp.B.Inputs[i];
+                string pn = PortName(bp.B, true, i, pin.Name);
+                bp.InWires.Add(plan.Wires.FirstOrDefault(x => x.TargetBlock == bp.B
+                                                              && (x.TargetPin == pn || x.TargetPin == pin.Name)));
+            }
             bp.SinkAssigns = new List<Wire>();
             foreach (var pin in bp.B.Outputs)
             {
@@ -1546,28 +1680,64 @@ public static partial class FbdGenerator
             bp.SinkAssigns.AddRange(branchSinks);
         }
 
-        // temp allocation
+        // Temp allocation. TriStation's compiler keeps one temp per type (_TEMP_BOOL_1,
+        // _TEMP_REAL_1, _TEMP_DINT_1, ...), numbering each type independently and reusing a slot
+        // once every consumer of the value it holds has been emitted. The declaration order is the
+        // order in which the slots are first needed, which is what the listing's VAR_TEMP shows.
         var tempOf = new Dictionary<BlockPlan, int>();
-        var live = new Dictionary<int, BlockPlan>();
+        var liveByType = new Dictionary<string, Dictionary<int, BlockPlan>>(StringComparer.OrdinalIgnoreCase);
+        var tempDecls = new List<(string Name, string Type)>();
+        var declaredTemps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var emitted = new HashSet<BlockPlan>();
         foreach (var b in seq)
         {
             if (b.B.IsFunction)
             {
+                // The result type of a generic operator (ADD/AND/GT/...) is the type of its
+                // operands, not BOOL: an ADD over DINT tags must land in _TEMP_DINT_n, otherwise the
+                // listing assigns a DINT expression to a BOOL variable and the compiler rejects it.
+                string type = FunctionResultType(b.B.TypeName);
+                if (type == "BOOL")
+                {
+                    foreach (var iw in b.InWires)
+                    {
+                        if (iw?.SourceVar != null && iw.SourceVar.DataType.Length > 0)
+                        {
+                            type = iw.SourceVar.DataType;
+                            break;
+                        }
+                        if (iw?.SourceBlock != null)
+                        {
+                            var sp = blocks.FirstOrDefault(x => x.B == iw.SourceBlock);
+                            if (sp != null && sp.Temp.StartsWith("_TEMP_", StringComparison.Ordinal))
+                            {
+                                int us = sp.Temp.IndexOf('_', 6);
+                                if (us > 6) { type = sp.Temp.Substring(6, us - 6); break; }
+                            }
+                        }
+                    }
+                    if (type.StartsWith("ANY", StringComparison.OrdinalIgnoreCase) || type.Length == 0) type = "BOOL";
+                }
+                if (!liveByType.TryGetValue(type, out var live))
+                    liveByType[type] = live = new Dictionary<int, BlockPlan>();
                 int idx = 1;
                 while (live.ContainsKey(idx)) idx++;
                 tempOf[b] = idx;
-                b.Temp = "_TEMP_BOOL_" + idx;
+                b.Temp = $"_TEMP_{type}_{idx}";
+                if (declaredTemps.Add(b.Temp)) tempDecls.Add((b.Temp, type));
                 live[idx] = b;
             }
             emitted.Add(b);
-            foreach (var kv in live.ToList())
+            foreach (var kv in liveByType.ToList())
             {
-                var consumers = blocks.Where(x => x != kv.Value && deps[x].Contains(kv.Value));
-                if (consumers.All(c => emitted.Contains(c))) live.Remove(kv.Key);
+                foreach (var slot in kv.Value.ToList())
+                {
+                    var consumers = blocks.Where(x => x != slot.Value && deps[x].Contains(slot.Value));
+                    if (consumers.All(c => emitted.Contains(c))) kv.Value.Remove(slot.Key);
+                }
             }
         }
-        int tempCount = blocks.Count(b => b.B.IsFunction) == 0 ? 0 : tempOf.Values.DefaultIfEmpty(0).Max();
+        int tempCount = tempDecls.Count;
 
         // header line computation
         var lines = new List<string>();
@@ -1575,36 +1745,77 @@ public static partial class FbdGenerator
         int Line() => lines.Count + 1;
 
         Add("(* Line 1: Extern Declaration *)");
-        var fbTypes = new List<string>();
+        // One annotated declaration per distinct block type, in first-use order, exactly like the
+        // listing TriStation writes: functions as FUNCTION EXTERN with their result type, function
+        // blocks with their full interface (including project-defined ones).
+        var declared = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var b in seq)
-            if (!b.B.IsFunction && !fbTypes.Contains(b.B.TypeName)) fbTypes.Add(b.B.TypeName);
-        foreach (var t in fbTypes)
         {
-            Add($"FUNCTION_BLOCK EXTERN {t}");
-            if (Lib.TryGetValue(t, out var meta))
+            if (!declared.Add(b.B.TypeName)) continue;
+            List<LibPin>? pins = null;
+            if (Lib.TryGetValue(b.B.TypeName, out var meta)) pins = meta.Pins;
+            else if (plan.ProjectTypes != null && plan.ProjectTypes.TryGetValue(b.B.TypeName, out var pt)) pins = pt.Pins;
+
+            if (b.B.IsFunction)
             {
-                var ins = meta.Pins.Where(x => x.Vt == 0).ToList();
-                var outs = meta.Pins.Where(x => x.Vt == 1).ToList();
-                var ios = meta.Pins.Where(x => x.Vt == 3).ToList();
-                if (ins.Count > 0) { Add("VAR_INPUT"); foreach (var x in ins) Add($"\t{x.Name} : {x.DataType};"); Add("END_VAR"); }
-                if (outs.Count > 0) { Add("VAR_OUTPUT"); foreach (var x in outs) Add($"\t{x.Name} : {x.DataType};"); Add("END_VAR"); }
-                if (ios.Count > 0) { Add("VAR"); foreach (var x in ios) Add($"\t{x.Name} : {x.DataType};"); Add("END_VAR"); }
+                // Only declared functions appear in the listing: library functions (SCALE,
+                // ReportBadParam, ... typed as element type 4) and the type conversions, whose
+                // result pin is the anonymous "()" placeholder. The generic operators
+                // (MOVE/AND/OR/NOT/GT/...) are built into the language.
+                var result = pins?.FirstOrDefault(x => x.Vt == 1);
+                bool isLibFunction = Lib.TryGetValue(b.B.TypeName, out var fm) && fm.Type == 4;
+                bool isConversion = result != null && result.Name == "()";
+                string resultType = result?.DataType ?? "";
+                if (pins == null || resultType.Length == 0 || (!isLibFunction && !isConversion))
+                {
+                    declared.Remove(b.B.TypeName);
+                    continue;
+                }
+                Add($"FUNCTION EXTERN {b.B.TypeName} : {resultType}");
+                var ins = pins!.Where(x => x.Vt == 0).ToList();
+                if (ins.Count > 0)
+                {
+                    Add("VAR_INPUT");
+                    int anon = 0;
+                    foreach (var x in ins)
+                    {
+                        string pinName = x.Name.Length > 0 ? x.Name : "IN" + anon++;
+                        Add($"\t{pinName} : {x.DataType};");
+                    }
+                    Add("END_VAR");
+                }
+                Add("END_FUNCTION");
             }
-            Add("END_FUNCTION_BLOCK");
+            else
+            {
+                Add($"FUNCTION_BLOCK EXTERN {b.B.TypeName}");
+                if (pins != null)
+                {
+                    var ins = pins.Where(x => x.Vt == 0).ToList();
+                    var outs = pins.Where(x => x.Vt == 1).ToList();
+                    var ios = pins.Where(x => x.Vt == 3).ToList();
+                    if (ins.Count > 0) { Add("VAR_INPUT"); foreach (var x in ins) Add($"\t{x.Name} : {x.DataType};"); Add("END_VAR"); }
+                    if (outs.Count > 0) { Add("VAR_OUTPUT"); foreach (var x in outs) Add($"\t{x.Name} : {x.DataType};"); Add("END_VAR"); }
+                    if (ios.Count > 0) { Add("VAR"); foreach (var x in ios) Add($"\t{x.Name} : {x.DataType};"); Add("END_VAR"); }
+                }
+                Add("END_FUNCTION_BLOCK");
+            }
+            Add("");
         }
-        Add("");
         Add($"(* Line {Line()}: POU Header *)");
         Add($"FUNCTION_BLOCK {p.Name}");
         var declLine = new Dictionary<string, int>();
         var inputs = p.Vars.Where(v => v.Section == "input").ToList();
         var inouts = p.Vars.Where(v => v.Section == "inOut").ToList();
         var outputs = p.Vars.Where(v => v.Section == "output").ToList();
-        var locals = p.Vars.Where(v => v.Section == "local").ToList();
+        // Program variables exported as <globalVars> are plain VAR entries in the listing; leaving
+        // them out makes the listing reference undeclared identifiers.
+        var locals = p.Vars.Where(v => v.Section == "local" || v.Section == "global").ToList();
         void VarSection(string kw, List<ExVar> vs)
         {
             if (vs.Count == 0) return;
             Add(kw);
-            foreach (var v in vs) { declLine[v.Name] = Line(); Add($"\t{v.Name} : {v.DataType}{(v.Derived.Length > 0 ? v.Derived : "")};"); }
+            foreach (var v in vs) { declLine[v.Name] = Line(); Add($"\t{v.Name} : {v.DataType};"); }
             Add("END_VAR");
         }
         VarSection("VAR_INPUT", inputs);
@@ -1613,13 +1824,19 @@ public static partial class FbdGenerator
         if (tempCount > 0)
         {
             Add("VAR_TEMP");
-            for (int i = 1; i <= tempCount; i++) Add($"\t_TEMP_BOOL_{i} : BOOL;");
+            foreach (var td in tempDecls) Add($"\t{td.Name} : {td.Type};");
             Add("END_VAR");
         }
         Add("");
         Add($"(* Line {Line()}: POU Body *)");
-        foreach (var s in p.Sheets.OrderBy(s => s.Number))
-            Add($"(* Line {Line()}: Network{s.Number}, Begin *)");
+        // Network<N> headers run up to the last sheet that actually carries logic; TriStation does
+        // not list an empty trailing sheet. Element sheet numbers come from the export, so take the
+        // highest one in use rather than the declared sheet count.
+        int networkCount = 1;
+        foreach (var bp0 in plan.Blocks) networkCount = Math.Max(networkCount, bp0.B.Sheet);
+        foreach (var vp in plan.Places.Keys) networkCount = Math.Max(networkCount, vp.Sheet);
+        for (int n = 1; n <= networkCount; n++)
+            Add($"(* Line {Line()}: Network{n}, Begin *)");
 
         foreach (var b in seq)
         {
@@ -1633,15 +1850,14 @@ public static partial class FbdGenerator
         }
         Add("END_FUNCTION_BLOCK");
         int endLine = Line() - 1;
+        plan.Listing = lines;
         for (int i = 0; i < seq.Count; i++)
         {
             int nextLine = i + 1 < seq.Count ? seq[i + 1].FirstLine : endLine;
             seq[i].LineCount = nextLine - seq[i].FirstLine;
         }
 
-        // store temp on block plan and per-placement line numbers
-        foreach (var bp in blocks)
-            if (tempOf.TryGetValue(bp, out var idx)) bp.Temp = "_TEMP_BOOL_" + idx;
+        // (block temps were assigned above when the slots were allocated)
 
         // attach wires to placements
         foreach (var w in plan.Wires)
@@ -1676,7 +1892,12 @@ public static partial class FbdGenerator
             string Resolve(Wire w)
             {
                 if (w.IsBranch && w.Parent != null) return Resolve(w.Parent);
-                if (w.SourceVar != null) return w.SourceVar.Expression;
+                if (w.SourceVar != null)
+                {
+                    var sv = w.SourceVar;
+                    if (sv.IsConstant) return TypedLiteral(sv);
+                    return sv.Expression;
+                }
                 if (w.SourceBlock != null)
                 {
                     var sp = blocks.FirstOrDefault(x => x.B == w.SourceBlock);
@@ -1702,8 +1923,24 @@ public static partial class FbdGenerator
             {
                 var ins = b.InWires.Where(w => w != null).Select(w => Resolve(w!)).ToList();
                 string op = b.B.Outputs.Count > 0 ? b.B.Outputs[0].Name : b.B.TypeName;
+                // A library function with named parameters is called as NAME((a),(b),...); the
+                // elementary operators (AND, OR, ADD, GT, ... - anonymous ANY pins) are infix.
+                bool isCall = Lib.TryGetValue(b.B.TypeName, out var fm)
+                              && fm.Pins.Any(x => x.Vt == 0 && x.Name.Length > 0);
                 yield return $"\t{b.Temp} :=(";
-                if (ins.Count <= 1)
+                if (isCall && ins.Count > 0)
+                {
+                    yield return $"\t{b.B.TypeName}(";
+                    for (int i = 0; i < ins.Count; i++)
+                    {
+                        if (i > 0) yield return "\t,";
+                        yield return "\t(";
+                        yield return $"\t\t{ins[i]}";
+                        yield return "\t)";
+                    }
+                    yield return "\t);";
+                }
+                else if (ins.Count <= 1)
                 {
                     yield return "\t";
                     if (ins.Count == 1)
@@ -1723,7 +1960,7 @@ public static partial class FbdGenerator
                         yield return "\t)";
                     }
                 }
-                yield return "\t);";
+                if (!isCall || ins.Count == 0) yield return "\t);";
             }
             foreach (var s in b.SinkAssigns)
             {
@@ -1742,12 +1979,115 @@ public static partial class FbdGenerator
     private static string CData(string s)
         => "<![CDATA[" + s.Replace("]]>", "]]]]><![CDATA[>") + "]]>";
 
+    /// <summary>Maps every library element to the installed library's catalogue identity. The
+    /// embedded base predates the installed TriStation library, so its dogTags (and the hex FName
+    /// that mirrors them) are stale; the compiler resolves library elements by these ids.</summary>
+    public static IReadOnlyDictionary<string, int> LibraryDogTags()
+    {
+        EnsureLibrarySnapshots();
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in Lib) map[kv.Key] = kv.Value.DogTag;
+        return map;
+    }
+
+    /// <summary>Compiler temp variables of a POU, exactly as the element's listing declares them.
+    /// A caller's block snapshot has to carry these: they are part of the interface TriStation
+    /// compares against when a project is compiled, and a snapshot without them is reported as an
+    /// out-of-date element.</summary>
+    public static List<LibPin> TempPins(string xmlPath, string pouName)
+    {
+        var pins = new List<LibPin>();
+        string listing;
+        try { listing = BuildListing(xmlPath, pouName); }
+        catch { return pins; }
+
+        bool inTemp = false;
+        foreach (var raw in listing.Split('\n'))
+        {
+            string line = raw.TrimEnd('\r').Trim();
+            if (!inTemp)
+            {
+                if (line == "VAR_TEMP") inTemp = true;
+                continue;
+            }
+            if (line == "END_VAR") break;
+            int colon = line.IndexOf(':');
+            if (colon <= 0) continue;
+            string name = line[..colon].Trim();
+            string type = line[(colon + 1)..].Trim().TrimEnd(';').Trim();
+            if (name.Length == 0 || type.Length == 0) continue;
+            pins.Add(new LibPin { Name = name, DataType = type, InitVal = "", Vt = 4, Flags = 48 });
+        }
+        return pins;
+    }
+
+    /// <summary>ST literal with an explicit type, which is what the compiler expects when a
+    /// constant feeds a typed pin (<c>REAL#4095.0</c>, <c>DINT#5</c>). Booleans stay TRUE/FALSE.</summary>
+    private static string TypedLiteral(ExVarPlace v)
+    {
+        string expr = v.Expression.Trim();
+        if (expr.Length == 0) return expr;
+        if (expr.Equals("TRUE", StringComparison.OrdinalIgnoreCase) || expr.Equals("FALSE", StringComparison.OrdinalIgnoreCase))
+            return expr.ToUpperInvariant();
+        if (!double.TryParse(expr, NumberStyles.Float, CultureInfo.InvariantCulture, out _)) return expr;
+
+        string type = v.DataType.Length > 0 && !v.DataType.Equals("BOOL", StringComparison.OrdinalIgnoreCase)
+            ? v.DataType
+            : (expr.Contains('.') || expr.Contains('e') || expr.Contains('E') ? "REAL" : "DINT");
+        return "(" + type + "#" + expr + ")";
+    }
+
+    /// <summary>Result type of a function block/function as the listing declares its temp: the
+    /// element's first output pin when that type is concrete, BOOL for the generic operators
+    /// (MOVE/AND/OR/... whose pins are ANY*).</summary>
+    private static string FunctionResultType(string typeName)
+    {
+        if (Lib.TryGetValue(typeName, out var meta))
+        {
+            var outPin = meta.Pins.FirstOrDefault(x => x.Vt == 1);
+            if (outPin != null && outPin.DataType.Length > 0
+                && !outPin.DataType.StartsWith("ANY", StringComparison.OrdinalIgnoreCase))
+                return outPin.DataType;
+        }
+        return "BOOL";
+    }
+
     private static int Tx(int v) => 10 * v + 40;
 
     public static byte[] GenerateBytes(string xmlPath, string pouName, IReadOnlyDictionary<string, TagInfo>? tagDesc = null, IReadOnlySet<string>? referencedTypes = null, int templateSheetCount = -1, bool forceDuplicated = false, IReadOnlyDictionary<string, ProjectTypeInfo>? projectTypes = null)
     {
         EnsureLibrarySnapshots();
         return Encoding.UTF8.GetBytes(Generate(xmlPath, pouName, tagDesc, referencedTypes, templateSheetCount, forceDuplicated, projectTypes));
+    }
+
+    /// <summary>Builds the ST listing TriStation keeps beside an FBD element (the <c>.IST</c>
+    /// stream): the element's declaration header plus one annotated block of ST per placed block.
+    /// This is the artifact a project needs for its elements to count as compiled.</summary>
+    public static string BuildListing(string xmlPath, string pouName)
+    {
+        EnsureLibrarySnapshots();
+        var p = Parse(xmlPath, pouName, null, null);
+        var plan = BuildPlan(p);
+        plan.ProjectTypes = BuildAllProjectTypes(xmlPath);
+        ComputeLayout(plan);
+        return plan.Listing == null ? "" : string.Join("\r\n", plan.Listing) + "\r\n";
+    }
+
+    /// <summary>Interface (pins only) of every function block defined by the XML, used for the
+    /// extern declarations at the top of a listing.</summary>
+    public static Dictionary<string, ProjectTypeInfo> BuildAllProjectTypes(string xmlPath)
+    {
+        var map = new Dictionary<string, ProjectTypeInfo>(StringComparer.OrdinalIgnoreCase);
+        var doc = XmlRepair.Load(xmlPath);
+        foreach (var e in doc.Descendants().Where(e => e.Name.LocalName == "pou"))
+        {
+            string name = (string?)e.Attribute("name") ?? "";
+            string type = (string?)e.Attribute("pouType") ?? "";
+            if (name.Length == 0 || type == "program") continue;
+            try { map[name] = BuildProjectType(xmlPath, name); }
+            catch { /* malformed POU: leave it out of the extern list */ }
+        }
+        return map;
     }
 
     private static string Generate(string xmlPath, string pouName, IReadOnlyDictionary<string, TagInfo>? tagDesc = null, IReadOnlySet<string>? referencedTypes = null, int templateSheetCount = -1, bool forceDuplicated = false, IReadOnlyDictionary<string, ProjectTypeInfo>? projectTypes = null)
@@ -1758,11 +2098,13 @@ public static partial class FbdGenerator
         // writing a second copy here makes the editor draw every block twice on open.
         bool duplicated = forceDuplicated;
         var plan = BuildPlan(p);
+        plan.ProjectTypes = projectTypes;
         _ = _commentIds;
         ComputeLayout(plan);
         // The ST layout above uses the logical wires; the FBD document uses the editor's
         // net decomposition and its wire ids.
         DecomposeNets(plan);
+        RepairWireRefs(plan);
         AssignWireIds(plan);
         plan.LastId = duplicated ? 2 * plan.PrimarySpan : plan.PrimarySpan;
 
@@ -1791,26 +2133,29 @@ public static partial class FbdGenerator
 
         // declarations
         sb.Append("<Collection Name=\"declarations\" ClassType=\"CTS2Vars\" CollectionType=\"1\">");
-        // Programs list every referenced tag (globals) first, sorted case-sensitively,
-        // then the function-block instances used by the body. FBs keep interface order.
+        // Programs list every referenced global tag first (sorted case-sensitively), then all
+        // remaining declarations (locals + function-block instances) sorted together.
+        // Function blocks keep their interface order.
         IEnumerable<ExVar> declOrder = p.Vars;
         if (p.PouType == "program")
-            declOrder = p.Vars.Where(v => !v.IsInstance).OrderBy(v => v.Name, StringComparer.Ordinal)
-                .Concat(p.Vars.Where(v => v.IsInstance).OrderBy(v => v.Name, StringComparer.Ordinal));
+            declOrder = p.Vars.Where(v => !v.IsInstance && v.Section == "global").OrderBy(v => v.Name, StringComparer.Ordinal)
+                .Concat(p.Vars.Where(v => v.IsInstance || v.Section != "global").OrderBy(v => v.Name, StringComparer.Ordinal));
         foreach (var v in declOrder)
         {
             var places = p.Placements.Where(x => x.Expression == v.Name).ToList();
-            int srcCount = places.Count(x => plan.Places[x].OutWire != null);
-            int sinkCount = places.Count(x => plan.Places[x].InWire != null);
+            // varVTType follows the declaration's interface section, not how the wire happens
+            // to use it: a local (or inOut) that is only ever written is still a local inOut
+            // (3), not an output (1). Reference FBDs confirm this for every POU.
             string vt;
             if (v.Section == "global") vt = "5";
             else if (v.IsInstance) vt = "3";
-            else if (v.Section == "output") vt = "1";
-            else if (srcCount > 0 && sinkCount > 0) vt = "3";
-            else if (sinkCount > 0) vt = "1";
-            else if (srcCount > 0) vt = "0";
-            else vt = v.Section switch { "inOut" => "3", _ => "0" };
-            string flags = v.IsInstance ? "33554434" : "0";
+            else vt = v.Section switch { "input" => "0", "output" => "1", _ => "3" };
+            // Instances of library elements inside a POU that is actually referenced (built)
+            // carry the 0x04000000 "library instance" bit; unbuilt POUs and project-defined
+            // function blocks use the plain instance flags.
+            string flags = v.IsInstance
+                ? (p.IsBuilt && Lib.ContainsKey(v.Derived) ? "100663298" : "33554434")
+                : "0";
             // The diagram is stored twice (primary + secondary copy), so each placement and
             // each FB instance occurrence is counted twice in the reference's reference
             // counts. A POU with no logic is not duplicated.
@@ -1827,17 +2172,13 @@ public static partial class FbdGenerator
             {
                 if (p.TagDesc != null && p.TagDesc.TryGetValue(v.Name, out var ti))
                 {
-                    desc = ti.Desc;
+                    // Descriptions in the declarations collection come from the POU's own
+                    // interface, never from the tag table (reference FBDs keep desc="" for
+                    // globals even when the tag has a description). The *type*, however, is
+                    // authoritative in the tag table: FBD global references often carry no
+                    // <type> (which we would otherwise default to BOOL) while the tag is
+                    // DINT/REAL, and the mismatch fails the build (WC0002).
                     if (ti.DataType.Length > 0) dataType = ti.DataType;
-                }
-                else
-                {
-                    // A declared global not present in the tag database is a program-local,
-                    // flagged 65536 only inside programs (function blocks keep flags 0).
-                    if (p.PouType == "program") flags = "65536";
-                    if ((v.Name.StartsWith("w", StringComparison.Ordinal) || v.Name.StartsWith("v", StringComparison.Ordinal))
-                        && (dataType == "REAL" || dataType == "DINT"))
-                        dataType = "BOOL";
                 }
             }
             sb.Append($"<Class name=\"{Esc(v.Name)}\" dataType=\"{Esc(dataType)}\"")
@@ -1869,14 +2210,18 @@ public static partial class FbdGenerator
                     // identity and interface so instances in other POUs resolve.
                     if (projectTypes != null && projectTypes.TryGetValue(type, out var pt))
                     {
-                        sb.Append($"<Class name=\"{Esc(type)}\" dogTag=\"{pt.DogTag}\" type=\"{pt.ElemType}\" subType=\"{pt.SubType}\"")
+                        // Project function blocks are written exactly the way TriStation's own
+                        // importer writes them: the catalogue DogTag, interface subType 0, the
+                        // element's ExtOptionFlags and a live eventConnectionsChanged record.
+                        // (Library elements keep their subtype and event from the platform.)
+                        sb.Append($"<Class name=\"{Esc(type)}\" dogTag=\"{pt.DogTag}\" type=\"{pt.ElemType}\" subType=\"0\"")
                           .Append($" instanceCount=\"{count}\" commentCount=\"0\" extOptFlags=\"{pt.ExtOptFlags}\"")
                           .Append($" cemEventInputs=\"{pt.CemEI}\" cemActionOutputs=\"{pt.CemAO}\">")
                           .Append($"<Class Embed=\"eventConnectionsChanged\" eventType=\"0\" eventId=\"{pt.EventId}\" date=\"{Esc(pt.Date)}\" user=\"{pt.User}\"/>")
                           .Append("<Collection Name=\"declarations\" ClassType=\"CTS2Vars\" CollectionType=\"1\">");
                         foreach (var pin in pt.Pins)
-                            sb.Append($"<Class name=\"{Esc(pin.Name)}\" dataType=\"{Esc(pin.DataType)}\" initVal=\"{Esc(pin.InitVal)}\" desc=\"\"")
-                              .Append($" varVTType=\"{pin.Vt}\" refCount=\"0\" fbRefCount=\"0\" flags=\"{pin.Flags}\" writes=\"0\"/>");
+                            sb.Append($"<Class name=\"{Esc(pin.Name)}\" dataType=\"{Esc(pin.DataType)}\" initVal=\"{Esc(pin.InitVal)}\" desc=\"{Esc(pin.Desc)}\"")
+                              .Append($" varVTType=\"{pin.Vt}\" refCount=\"{pin.RefCount}\" fbRefCount=\"{pin.FbRefCount}\" flags=\"{pin.Flags}\" writes=\"0\"/>");
                         sb.Append("</Collection></Class>");
                         continue;
                     }
@@ -1892,8 +2237,8 @@ public static partial class FbdGenerator
                   .Append($"<Class Embed=\"eventConnectionsChanged\" eventType=\"0\" eventId=\"{m.EventId}\" date=\"{m.Date}\" user=\"{m.User}\"/>")
                   .Append("<Collection Name=\"declarations\" ClassType=\"CTS2Vars\" CollectionType=\"1\">");
                 foreach (var pin in m.Pins)
-                    sb.Append($"<Class name=\"{Esc(pin.Name)}\" dataType=\"{Esc(pin.DataType)}\" initVal=\"{Esc(pin.InitVal)}\" desc=\"\"")
-                      .Append($" varVTType=\"{pin.Vt}\" refCount=\"0\" fbRefCount=\"0\" flags=\"{pin.Flags}\" writes=\"0\"/>");
+                    sb.Append($"<Class name=\"{Esc(pin.Name)}\" dataType=\"{Esc(pin.DataType)}\" initVal=\"{Esc(pin.InitVal)}\" desc=\"{Esc(pin.Desc)}\"")
+                      .Append($" varVTType=\"{pin.Vt}\" refCount=\"{pin.RefCount}\" fbRefCount=\"0\" flags=\"{pin.Flags}\" writes=\"0\"/>");
                 sb.Append("</Collection></Class>");
             }
             sb.Append("</Collection>");
@@ -1945,7 +2290,28 @@ public static partial class FbdGenerator
         sb.Append("</Collection>");
 
         sb.Append("</SerializableClass>\r\n");
-        return sb.ToString();
+        string text = sb.ToString();
+        ValidateFbdReferences(p, text);
+        return text;
+    }
+
+    /// <summary>Sanity check for arbitrary (custom) FBDs: every <c>connectId</c>/<c>inConnectId</c>/
+    /// <c>outConnectId</c> must resolve to an element or wire written in the same document.
+    /// A dangling reference makes TriStation report the element as unconnected, so surface it
+    /// during conversion instead of producing a silently broken project.</summary>
+    private static void ValidateFbdReferences(ExPou p, string text)
+    {
+        var ids = new HashSet<string>();
+        foreach (Match m in Regex.Matches(text, "localId=\"(\\d+)\"")) ids.Add(m.Groups[1].Value);
+        var missing = new List<string>();
+        foreach (Match m in Regex.Matches(text, "(?:connectId|inConnectId|outConnectId)=\"(\\d+)\""))
+        {
+            string id = m.Groups[1].Value;
+            if (id != "0" && !ids.Contains(id)) missing.Add(id);
+        }
+        if (missing.Count > 0)
+            Console.Error.WriteLine($"  warning: {p.Name}: {missing.Count} unresolved connection id(s): "
+                                    + string.Join(",", missing.Distinct().Take(8)));
     }
 
     /// <summary>
@@ -2053,9 +2419,9 @@ public static partial class FbdGenerator
     private static string? EmitVar(Plan plan, ExVarPlace v, int id, int idOffset = 0)
     {
         var pp = plan.Places[v];
-        // TriStation's editor keeps an opaque per-placement "network" handle (values such as
-        // 31199/17440/901). It is not carried by the PLCopen export and cannot be derived from
-        // it, so it is omitted rather than invented; the attribute is optional in the schema.
+        // TriStation stores literal placements without a network attribute (the compiler
+        // resolves them from the direct pin link); forcing one makes it look for a net that
+        // does not exist and reports the literal as unconnected.
         string netAttr = "";
         bool wired = pp.OutWire != null && !pp.OutWire.Suppress;
         if (v.IsConstant && v.Kind != "in" && !wired) return null;
@@ -2067,10 +2433,13 @@ public static partial class FbdGenerator
             else if (ow != null) { outConn = "IN1"; outId = ow.Id + idOffset; }
             else { outConn = ""; outId = 0; }
             string dt = v.DataType.Length > 0 ? v.DataType : (v.Expression.Contains('.') ? "REAL" : "DINT");
+            bool annotate = v.Annotate.Equals("true", StringComparison.OrdinalIgnoreCase);
+            int annHeight = annotate ? Math.Max(1, v.H - 2) : 4;
             return $"<Class ClassType=\"CFBDOutVarXml\" varName=\"{Esc(v.Expression)}\" varType=\"CONSTANT\""
                  + $" varDataType=\"{Esc(dt)}\" localId=\"{id}\" posX=\"{Tx(v.X)}\" posY=\"{Tx(v.Y)}\""
                  + $" width=\"{10 * v.W}\" height=\"{10 * v.H}\"{netAttr} outConnection=\"{Esc(outConn)}\""
-                 + $" outConnectId=\"{outId}\" annotate=\"False\" annotationHeight=\"4\" annotateMonitorValue=\"False\"/>";
+                 + $" outConnectId=\"{outId}\" annotation=\"{Esc(v.Annotation)}\" annotate=\"{Title(v.Annotate)}\""
+                 + $" annotationHeight=\"{annHeight}\" annotateMonitorValue=\"{Title(v.MonitorValue)}\"/>";
         }
         string cls = v.Kind == "in" ? "CFBDOutVarXml" : "CFBDInOutVarXml";
         var sb = new StringBuilder();
@@ -2078,15 +2447,21 @@ public static partial class FbdGenerator
           .Append($" posX=\"{Tx(v.X)}\" posY=\"{Tx(v.Y)}\" width=\"{10 * v.W}\" height=\"{10 * v.H}\"{netAttr}");
         if (pp.OutWire != null)
         {
-            if (pp.OutWire.Suppress && pp.OutWire.TargetBlock != null)
+            if (pp.OutWire.Suppress || pp.OutWire.Drop)
                 sb.Append($" outConnection=\"{Esc(pp.OutWire.TargetPin)}\" outConnectId=\"{elementIdOf(plan, pp.OutWire.Target) + idOffset}\"");
             else
                 sb.Append($" outConnection=\"IN1\" outConnectId=\"{pp.OutWire.Id + idOffset}\"");
         }
         sb.Append($" annotation=\"{Esc(v.Annotation)}\" annotate=\"{Title(v.Annotate)}\"")
           .Append($" annotationHeight=\"{(Title(v.Annotate) == "True" ? v.H - 2 : 4)}\" annotateMonitorValue=\"{Title(v.MonitorValue)}\"");
-        if (pp.InWire != null)
+        if (pp.InWire != null && !pp.InWire.Suppress && !pp.InWire.Drop)
             sb.Append($" inConnection=\"{(pp.InWire.IsBranch ? "IN1" : "OUT1")}\" inConnectId=\"{pp.InWire.Id + idOffset}\"");
+        else if (v.DirectInSource != null)
+            sb.Append($" inConnection=\"{Esc(v.DirectInPin)}\" inConnectId=\"{elementIdOf(plan, v.DirectInSource) + idOffset}\"");
+        else if (pp.InWire != null)
+            // Suppressed wire (a literal link TriStation keeps as a direct pin link): point the
+            // variable at the source element instead of a wire id that is not written.
+            sb.Append($" inConnection=\"{Esc(pp.InWire.SourcePin)}\" inConnectId=\"{elementIdOf(plan, pp.InWire.Source) + idOffset}\"");
         sb.Append("/>");
         return sb.ToString();
     }
@@ -2128,9 +2503,26 @@ public static partial class FbdGenerator
         }
         sb.Append($" typeName=\"{Esc(b.TypeName)}\" localId=\"{id}\"")
           .Append($" posX=\"{Tx(b.X)}\" posY=\"{Tx(b.Y)}\" width=\"{10 * b.W}\" height=\"{height}\"");
+        // Line mapping (network/firstLineNumber/lineCount, and the per-pin lineOffset) exists only
+        // where TriStation keeps a compiler listing, i.e. for function blocks. A program has no
+        // listing, and writing these attributes there makes the compiler take an unsupported path.
+        bool withLayout = !plan.P.PouType.Equals("program", StringComparison.OrdinalIgnoreCase);
+        if (withLayout)
+        {
+            sb.Append($" network=\"{b.Sheet}\"")
+              .Append(bp.FirstLine > 0 ? $" firstLineNumber=\"{bp.FirstLine}\"" : "")
+              .Append(bp.LineCount > 0 ? $" lineCount=\"{bp.LineCount}\"" : "");
+        }
         // Build network ids on blocks are editor edit-history state (present on some blocks
         // and absent on others), so they are not emitted; the execute sequence is always 0.
-        sb.Append($" snapEventId=\"{(Lib.TryGetValue(b.TypeName, out var m) ? m.EventId : 0)}\"")
+        // The snapshot event ties this instance to the referenced element's interface version:
+        // the platform library's event for library types, the project element's own
+        // eventConnectionsChanged id for a function block defined by this project. Emitting 0
+        // for those leaves the instance unresolved (red cross in the editor).
+        int snapEvent = 0;
+        if (Lib.TryGetValue(b.TypeName, out var m)) snapEvent = m.EventId;
+        else if (plan.ProjectTypes != null && plan.ProjectTypes.TryGetValue(b.TypeName, out var pt)) snapEvent = pt.EventId;
+        sb.Append($" snapEventId=\"{snapEvent}\"")
           .Append($" enEnO=\"False\" doubleSpace=\"{(b.DoubleSpace ? "True" : "False")}\"")
           .Append(" sequence=\"0\">");
         sb.Append("<Collection Name=\"inputs\" ClassType=\"CDGMInputXml\" CollectionType=\"1\">");
@@ -2139,32 +2531,49 @@ public static partial class FbdGenerator
             var w = bp.InWires[i];
             string pinName = PortName(b, true, i, b.Inputs[i].Name);
             string inv = b.Inputs[i].Negated ? " invertedPin=\"True\"" : "";
+            // lineOffset is the pin's row inside the block; the network compiler uses it to
+            // place the pin when the feeding element is a literal.
+            string lineOffset = withLayout && b.Inputs[i].RelY > 0 ? $" lineOffset=\"{b.Inputs[i].RelY}\"" : "";
             if (w == null || w.Drop)
             {
                 // Unconnected (or dropped) pins are still listed, with no connection attrs.
-                sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\"/>");
+                sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\"{lineOffset}/>");
                 continue;
             }
             if (w.Suppress)
             {
                 var sv = (ExVarPlace)w.Source;
                 sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\" effectiveParam=\"{Esc(sv.Expression)}\"")
-                  .Append($" connectId=\"{elementIdOf(plan, w.Source) + idOffset}\"/>");
+                  .Append($" connectId=\"{elementIdOf(plan, w.Source) + idOffset}\"{lineOffset}/>");
                 continue;
             }
             sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\" effectiveParam=\"{(w.IsBranch || (ReferenceEquals(w.Source, b) && w.SourcePin == b.Inputs[i].Name) ? "IN1" : "OUT1")}\"")
-              .Append($" connectId=\"{w.Id + idOffset}\"/>");
+              .Append($" connectId=\"{w.Id + idOffset}\"{lineOffset}/>");
         }
         sb.Append("</Collection>");
         sb.Append("<Collection Name=\"outputs\" ClassType=\"CDGMOutputXml\" CollectionType=\"1\">");
         for (int oi = 0; oi < b.Outputs.Count; oi++)
         {
             var pin = b.Outputs[oi];
+            string pinName = PortName(b, false, oi, pin.Name);
             bp.OutWires.TryGetValue(pin.Name, out var w);
             string inv = pin.Negated ? " invertedPin=\"True\"" : "";
-            string pinName = PortName(b, false, oi, pin.Name);
             if (w == null)
-                sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\"/>");
+            {
+                // A degenerate (zero-length) link lives only as a direct pin link: the original
+                // project stores the sink's variable name + element id on the feeding pin.
+                var sink = plan.Places.FirstOrDefault(kv => kv.Key is ExVarPlace ev && !ev.IsConstant
+                    && ReferenceEquals(ev.DirectInSource, b) && ev.DirectInPin == pinName);
+                if (sink.Key is ExVarPlace sv)
+                    sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\" effectiveParam=\"{Esc(sv.Expression)}\" connectId=\"{ElemIdRaw(plan, sv) + idOffset}\"/>");
+                else
+                    sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\"/>");
+            }
+            else if (w.Suppress || w.Drop)
+                // Direct pin link (degenerate/suppressed): the editor stores the target on the
+                // pin itself (effectiveParam = target pin/name, connectId = target element).
+                // Emitting a wire id here would dangle because no wire is written.
+                sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\" effectiveParam=\"{Esc(w.TargetPin)}\" connectId=\"{elementIdOf(plan, w.Target) + idOffset}\"/>");
             else
                 sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\" effectiveParam=\"IN1\" connectId=\"{w.Id + idOffset}\"/>");
         }
@@ -2174,12 +2583,20 @@ public static partial class FbdGenerator
 
     private static string EmitWire(Plan plan, Wire w, int idOffset = 0)
     {
-        string inputEffective = w.IsBranch ? w.TargetPin : w.SourcePin;
-        int inputConnect = elementIdOf(plan, w.IsBranch ? w.Target : w.Source) + idOffset;
+        // A branch arm leaves the same source pin as its trunk; its "output" points at the
+        // junction on the parent wire (connectId = parent id, effectiveParam = V<n>).
+        string inputEffective = w.SourcePin;
+        int inputConnect = elementIdOf(plan, w.Source) + idOffset;
         string outputEffective = w.IsBranch ? "V" + w.Vn : w.TargetPin;
         int outputConnect = (w.IsBranch ? w.Parent!.Id : elementIdOf(plan, w.Target)) + idOffset;
         var sb = new StringBuilder();
-        sb.Append($"<Class ClassType=\"CDGMWireXml\" localId=\"{w.Id + idOffset}\" feedBack=\"False\" network=\"0\">");
+        int wireSheet = 0;
+        // TriStation orders the blocks of a network left-to-right and rejects a wire whose
+        // source executes after its target ("illegal cycle", WG0010) unless it is marked as a
+        // feedback. The XML's per-connection flag is unreliable (lossy exports carry false on
+        // every edge), so derive it from geometry: a wire running backwards in x is feedback.
+        bool feedback = w.FeedBack || (!w.IsBranch && w.Source.X > w.Target.X);
+        sb.Append($"<Class ClassType=\"CDGMWireXml\" localId=\"{w.Id + idOffset}\" feedBack=\"{(feedback ? "True" : "False")}\" network=\"{wireSheet}\">");
         sb.Append($"<Class Embed=\"input\" formalParam=\"IN1\" effectiveParam=\"{Esc(inputEffective)}\" connectId=\"{inputConnect}\"/>");
         sb.Append($"<Class Embed=\"output\" formalParam=\"OUT1\" effectiveParam=\"{Esc(outputEffective)}\" connectId=\"{outputConnect}\"/>");
         sb.Append("<Collection Name=\"positions\" ClassType=\"CDGMPositionXml\" CollectionType=\"1\">");

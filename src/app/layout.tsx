@@ -63,7 +63,17 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
+    // The landing pages arm their scroll reveals from an inline script that runs before the
+    // first paint (RevealBootstrap sets data-reveal on <html>), so the DOM intentionally has
+    // an attribute the server markup cannot know about. suppressHydrationWarning only covers
+    // this element's own attributes; children are still checked. data-scroll-behavior lets the
+    // router suspend the smooth scrolling that globals.css switches on while it resets scroll.
+    <html
+      lang="en"
+      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      data-scroll-behavior="smooth"
+      suppressHydrationWarning
+    >
       <body className="min-h-full flex flex-col bg-ink-950 text-mist-200">{children}</body>
     </html>
   );

@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { databasePath } from "./env";
+import { bootstrapAdmin, databasePath } from "./env";
+import { hashPassword } from "./password";
+import { newId, nowIso } from "./util";
 
 // Kept inline (rather than imported from ./licensing) to avoid a circular import
 // between the DB bootstrap and the licensing module. Must stay in sync with
@@ -99,6 +101,61 @@ function applyMigrations(db: Sqlite): void {
   }
 }
 
+/**
+ * Recreates the bootstrap administrator described by BOOTSTRAP_ADMIN_EMAIL /
+ * BOOTSTRAP_ADMIN_PASSWORD.
+ *
+ * A host without a persistent disk starts from an empty database after every
+ * deploy, so without this nobody could reach /dashboard/admin. The account is
+ * created only when the email is unknown; an existing account keeps its password
+ * and only has its role re-asserted, so a password changed in the UI survives the
+ * next cold start. The license grants every feature, matching what an owner
+ * account needs to exercise the pipeline end to end.
+ */
+function seedBootstrapAdmin(db: Sqlite): void {
+  const admin = bootstrapAdmin();
+  if (!admin) return;
+
+  try {
+    const existing = db.prepare("SELECT id, role FROM users WHERE email = ?").get(admin.email) as
+      | { id: string; role: string }
+      | undefined;
+
+    if (existing) {
+      if (existing.role !== "admin") {
+        db.prepare("UPDATE users SET role = 'admin', updated_at = ? WHERE id = ?").run(nowIso(), existing.id);
+      }
+      ensureAdminLicense(db, existing.id);
+      return;
+    }
+
+    const userId = newId("usr");
+    const createdAt = nowIso();
+    db.transaction(() => {
+      db.prepare(
+        `INSERT INTO users (id, email, name, company, password_hash, role, plan, created_at, updated_at)
+         VALUES (?, ?, ?, NULL, ?, 'admin', 'enterprise', ?, ?)`,
+      ).run(userId, admin.email, admin.email.split("@")[0], hashPassword(admin.password), createdAt, createdAt);
+      ensureAdminLicense(db, userId);
+    })();
+  } catch (error) {
+    // A bootstrap failure must not stop the server from booting: the rest of the
+    // schema is independent of this row.
+    console.error("Could not seed the bootstrap administrator:", error);
+  }
+}
+
+function ensureAdminLicense(db: Sqlite, userId: string): void {
+  const license = db.prepare("SELECT id FROM licenses WHERE user_id = ?").get(userId);
+  if (license) return;
+
+  const key = `XMSW-ENT-${newId("lic").slice(4, 16).toUpperCase().match(/.{4}/g)?.join("-") ?? "ADMIN"}`;
+  db.prepare(
+    `INSERT INTO licenses (id, user_id, key, plan, status, seats, activations, activation_limit, features, notes, created_at, expires_at, last_used_at)
+     VALUES (?, ?, ?, 'enterprise', 'active', 25, 0, 25, ?, 'bootstrap administrator', ?, NULL, NULL)`,
+  ).run(newId("lic"), userId, key, ALL_FEATURES_JSON, nowIso());
+}
+
 export function getDb(): Sqlite {
   if (instance) return instance;
 
@@ -113,6 +170,7 @@ export function getDb(): Sqlite {
   db.pragma("busy_timeout = 5000");
   db.exec(loadSchema());
   applyMigrations(db);
+  seedBootstrapAdmin(db);
   instance = db;
   return db;
 }

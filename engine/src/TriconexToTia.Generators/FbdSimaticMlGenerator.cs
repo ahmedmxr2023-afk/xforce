@@ -3137,19 +3137,26 @@ internal static class FbdXmlWriter
     {
         var blocks = context.Project.Blocks;
         var index = blocks.IndexOf(block);
-        if (index < 0) return 1;
-        if (block.BlockType != BlockType.OB) return index + 1;
+        if (index < 0) return 101;
+        // Function blocks start at 100. STEP 7 Safety numbers its main safety block FB 1 (with
+        // Main_Safety_RTG1_DB as DB 1) as soon as an F-CPU is added to a project, so a converted
+        // block numbered 1 would collide with it when the package is imported into the customer's
+        // project.
+        if (block.BlockType != BlockType.OB) return index + 100;
 
         // A ProgramCycle OB number must be 1 or within 123..32767; TIA rejects the numbers in
-        // between ("'8' is not a valid OB number"). Give each program OB a valid, unique number:
-        // the first is 1, the rest 123, 124, ...
+        // between ("'8' is not a valid OB number"). 123..127, however, belong to the fail-safe
+        // OBs STEP 7 Safety creates for its F-runtime groups (FOB_RTG1 is OB 123 by default): a
+        // standard OB that lands on one of those numbers is compiled as part of the safety
+        // program, and every standard block it calls is rejected with WF0018 ("out-of-date
+        // element") and WF0050 ("Element is not a safety element"). Keep clear of that range.
         var ordinal = 0;
         for (var i = 0; i <= index; i++)
         {
             if (context.Project.Blocks[i].BlockType == BlockType.OB) ordinal++;
         }
 
-        return ordinal <= 1 ? 1 : 121 + ordinal;
+        return ordinal <= 1 ? 1 : 198 + ordinal;
     }
 
     private static void WriteNetwork(XmlWriter writer, TiaXmlDocument.IdAllocator ids, FbdNetworkDocument network)

@@ -75,7 +75,7 @@ public static class Tags
             foreach (Match m in Regex.Matches(g.Groups[1].Value, "<variable name=\"([^\"]+)\"\\s*>(.*?)</variable>", RegexOptions.Singleline))
             {
                 string name = m.Groups[1].Value;
-                if (name.Length == 0 || name.All(char.IsDigit) || name.StartsWith("wSPARE")) continue;
+                if (name.Length == 0 || name.All(char.IsDigit)) continue;
                 var tm = Regex.Match(m.Groups[2].Value, "<type>\\s*<([A-Za-z_]\\w*)");
                 xmlType[name] = tm.Success ? tm.Groups[1].Value : "?";
             }

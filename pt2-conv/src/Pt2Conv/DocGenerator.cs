@@ -23,6 +23,8 @@ public static class DocGenerator
         var doc = XmlRepair.Load(xmlPath);
         var pou = doc.Descendants()
             .FirstOrDefault(e => e.Name.LocalName == "pou" && (string?)e.Attribute("name") == pouName)
+            ?? doc.Descendants()
+                .FirstOrDefault(e => e.Name.LocalName == "pou" && string.Equals((string?)e.Attribute("name"), pouName, StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidOperationException($"POU '{pouName}' not found");
 
         string drawingNumber = "", drawingTitle = "";

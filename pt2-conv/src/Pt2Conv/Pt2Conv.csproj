@@ -13,6 +13,12 @@
   <ItemGroup>
     <EmbeddedResource Include="Resources\base.pt2x.gz" LogicalName="Pt2Conv.Resources.base.pt2x.gz" />
     <EmbeddedResource Include="Resources\library_snapshots.json" LogicalName="Pt2Conv.Resources.library_snapshots.json" />
+    <EmbeddedResource Include="Resources\library_compiled.json" LogicalName="Pt2Conv.Resources.library_compiled.json" />
+    <EmbeddedResource Include="Resources\library_records.json" LogicalName="Pt2Conv.Resources.library_records.json" />
+    <EmbeddedResource Include="Resources\library_versions.json" LogicalName="Pt2Conv.Resources.library_versions.json" />
+    <EmbeddedResource Include="Resources\library_host.json" LogicalName="Pt2Conv.Resources.library_host.json" />
+    <EmbeddedResource Include="Resources\library_extlibobj.txt" LogicalName="Pt2Conv.Resources.library_extlibobj.txt" />
+    <EmbeddedResource Include="Resources\lib\*.gz" LogicalName="Pt2Conv.Resources.lib.%(Filename)%(Extension)" />
     <EmbeddedResource Include="Resources\hw_module_defaults.json" LogicalName="Pt2Conv.Resources.hw_module_defaults.json" />
     <EmbeddedResource Include="Resources\hw_board_catalog.json" LogicalName="Pt2Conv.Resources.hw_board_catalog.json" />
     <EmbeddedResource Include="Resources\lib_*.ole.gz" LogicalName="Pt2Conv.Resources.%(Filename)%(Extension)" />

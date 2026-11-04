@@ -51,6 +51,8 @@ public static class Program
                 "tagmatrix" => TagMatrix.Run(args),
                 "findtemplate" => FindTemplate.Run(args),
                 "base" => BaseCmd(args),
+                "check" => Capabilities.Run(args),
+                "stlist" => StList.Run(args),
                 "help" or "-h" or "--help" => PrintUsageSafe(),
                 _ => PrintUnknown(args[0]),
             };
@@ -128,6 +130,7 @@ Commands:
   addpou <tmpl> <out> <srcPOU> <new>   [PHASE-1 PROBE] clone a POU folder+entry under a new name/DogTag.
   findtemplate <xml> <searchDir>        Find a .pt2x whose POU catalog matches the XML.
   base <out.pt2x> | base --extract [dir]  Emit/extract the embedded generic base project.
+  check <xml>                           Pre-flight: report what the builder cannot convert.
 """);
     }
 
