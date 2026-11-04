@@ -1402,9 +1402,11 @@ public static class BuildXml
             try
             {
                 map[name] = FbdGenerator.BuildProjectType(xmlPath, name);
-                // The element's compiler temps are part of the interface a block instance stores;
-                // without them the instance is out of date the moment the project is compiled.
-                foreach (var temp in FbdGenerator.TempPins(xmlPath, name)) map[name].Pins.Add(temp);
+                // Do NOT append the compiler temps from our own listing: TriStation's stored
+                // interface contains only the declared variables (its compiler adds/updates
+                // temps itself when the project is built). Writing a different temp set makes
+                // every instance of the block an out-of-date interface, which the editor draws
+                // as a red diagonal slash over the block.
             }
             catch { /* a malformed POU keeps the unknown-type fallback */ }
         }
@@ -1435,7 +1437,38 @@ public static class BuildXml
                 }
                 if (Environment.GetEnvironmentVariable("PT2_DEBUG_EVENTS") == "1" && n.Equals("FB04_DI", StringComparison.OrdinalIgnoreCase))
                     Console.Error.WriteLine($"[ev] {n} dog={info.DogTag} type={info.ElemType} conn={info.EventId}");
+
+                // The element's catalogue must carry its interface. TriStation resolves an
+                // instance by comparing the block's stored snapshot with this Declarations
+                // collection; an entry with no Declarations (our inserted POU) makes every
+                // instance an out-of-date interface, which the editor draws as a red diagonal
+                // slash over the block.
+                var decls = c.Elements().FirstOrDefault(x =>
+                    x.Name.LocalName == "Collection" && (string?)x.Attribute("Name") == "Declarations");
+                if (decls == null)
+                {
+                    decls = new XElement(c.Name.Namespace + "Collection",
+                        new XAttribute("Name", "Declarations"),
+                        new XAttribute("ClassType", "CTS2Vars"),
+                        new XAttribute("CollectionType", "1"));
+                    c.Add(decls);
+                }
+                decls.RemoveNodes();
+                foreach (var pin in info.Pins)
+                {
+                    decls.Add(new XElement(c.Name.Namespace + "Class",
+                        new XAttribute("name", pin.Name),
+                        new XAttribute("dataType", pin.DataType),
+                        new XAttribute("initVal", pin.InitVal),
+                        new XAttribute("desc", pin.Desc),
+                        new XAttribute("varVTType", pin.Vt.ToString(CultureInfo.InvariantCulture)),
+                        new XAttribute("refCount", pin.RefCount.ToString(CultureInfo.InvariantCulture)),
+                        new XAttribute("fbRefCount", pin.FbRefCount.ToString(CultureInfo.InvariantCulture)),
+                        new XAttribute("flags", pin.Flags.ToString(CultureInfo.InvariantCulture)),
+                        new XAttribute("writes", "0")));
+                }
             }
+            tree[px] = ("Current/Project.xml", AddPou.SerializeProject(doc.Root!));
         }
         catch { /* catalogue is best-effort */ }
         return map;

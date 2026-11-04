@@ -2328,7 +2328,16 @@ public static partial class FbdGenerator
             return ElemIdRaw(plan, anchor);
         }
 
-        var wires = plan.Wires.Where(w => !w.Suppress && sheets.Contains(w.Target.Sheet)).ToList();
+        // A branch arm with a single point is decomposition noise: it carries no geometry, and
+        // TriStation rejects it as an overlapping wire (WF0032). The same connection is stored
+        // the way the importer stores a zero-length link: directly on the block pin
+        // (effectiveParam = source expression, connectId = source element). Marking it
+        // suppressed routes it through that path for the pin and keeps the wire out.
+        foreach (var w in plan.Wires)
+            if (w.IsBranch && w.PathExport.Count < 2) w.Suppress = true;
+        var wires = plan.Wires
+            .Where(w => !w.Suppress && sheets.Contains(w.Target.Sheet))
+            .ToList();
         var byAnchor = new Dictionary<int, List<Wire>>();
         foreach (var w in wires)
         {
