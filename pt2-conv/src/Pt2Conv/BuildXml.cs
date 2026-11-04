@@ -1277,30 +1277,24 @@ public static class BuildXml
             if (type != "1" && type != "2") continue;
             bool isProgram = type == "1";
 
-            // A fresh TriStation import writes ExtOptionFlags=2 for every project POU it
-            // generates (FBD function blocks included); 3 only appears once the element has
-            // been compiled/edited by the editor.
-            string want = "2";
+            // TriStation's XML importer compiles each POU as it loads it, so a genuine import
+            // carries the compiled state: ExtOptionFlags 3 for FBD logic elements, the 0x6000
+            // and 0x20040 "compiled image" flag bits, and a real EventCompiled id. Without that
+            // state the editor draws every instance of the block with the out-of-date red X.
+            string want = (isProgram || PromotesToSt(xmlPath, name)) ? "2" : "3";
             if ((string?)c.Attribute("ExtOptionFlags") != want)
             {
                 c.SetAttributeValue("ExtOptionFlags", want);
                 changed = true;
             }
 
-            // A TriStation import normalises the catalogue to this shape: generic subtype 0,
-            // owner 0, version 1.0, ExtOptionFlags 2, and NO "compiled image" bits. A genuine
-            // unbuilt import carries Flags 0x10081F for an FBD function block; the 0x6000 and
-            // 0x20040 bits only appear after a successful compile (together with a real
-            // EventCompiled id and a compiled database). Claiming that state without the
-            // compiled image makes the editor draw the block as out of date (grey box with
-            // bare pin stubs), so clear those bits here.
             if ((string?)c.Attribute("ElementSubType") != "0") { c.SetAttributeValue("ElementSubType", "0"); changed = true; }
             if ((string?)c.Attribute("Owner") != "0") { c.SetAttributeValue("Owner", "0"); changed = true; }
             if ((string?)c.Attribute("LockOwner") != "0") { c.SetAttributeValue("LockOwner", "0"); changed = true; }
             if (!isProgram && int.TryParse((string?)c.Attribute("Flags"), out int fl))
             {
-                int unbuilt = fl & ~(0x6000 | 0x20000 | 0x40);
-                if (unbuilt != fl) { c.SetAttributeValue("Flags", unbuilt.ToString(CultureInfo.InvariantCulture)); changed = true; }
+                int compiledFlags = fl | 0x6000 | 0x20000 | 0x40;
+                if (compiledFlags != fl) { c.SetAttributeValue("Flags", compiledFlags.ToString(CultureInfo.InvariantCulture)); changed = true; }
             }
 
             var created = Embedded(c, "EventCreated");
@@ -1341,7 +1335,7 @@ public static class BuildXml
             // point at a real interface version.
             int connId = isProgram ? 0 : nextEvent++;
             // TriStation records the compile against the same connections event (or an older one).
-            int compiledId = connId > 0 ? connId : nextEvent++;
+            int compiledId = connId;
 
             Stamp(created, createdId, stamp);
             Stamp(version, versionId, stamp);
@@ -1354,27 +1348,35 @@ public static class BuildXml
                 conn.SetAttributeValue("date", "1970-01-01 00:00:00");
                 conn.SetAttributeValue("user", "0");
             }
-            // Do NOT claim a compiled state: the compiled database (Project.EMA) is not produced by
-            // this builder, and an element that advertises EventCompiled/flags without real compiled
-            // code makes TriStation skip the compile and fail later with WC0140.
+            // Match the imported state: the compile event is recorded on the connections event
+            // and RefTrigger points at the modification event.
             if (compiled != null)
             {
-                compiled.SetAttributeValue("eventType", "0");
-                compiled.SetAttributeValue("eventId", "0");
-                compiled.SetAttributeValue("date", "1970-01-01 00:00:00");
-                compiled.SetAttributeValue("user", "0");
+                if (compiledId > 0) Stamp(compiled, compiledId, stamp);
+                else
+                {
+                    compiled.SetAttributeValue("eventType", "0");
+                    compiled.SetAttributeValue("eventId", "0");
+                    compiled.SetAttributeValue("date", "1970-01-01 00:00:00");
+                    compiled.SetAttributeValue("user", "0");
+                }
             }
             if (refTrigger != null)
             {
-                // No compiled image, so there is no compile trigger to reference: an unbuilt
-                // import keeps RefTrigger empty (DogTag/EventId 0).
-                refTrigger.SetAttributeValue("DogTag", "0");
-                refTrigger.SetAttributeValue("EventId", "0");
-                refTrigger.SetAttributeValue("Date", "1970-01-01 00:00:00");
+                if (isProgram)
+                {
+                    refTrigger.SetAttributeValue("DogTag", "0");
+                    refTrigger.SetAttributeValue("EventId", "0");
+                    refTrigger.SetAttributeValue("Date", "1970-01-01 00:00:00");
+                }
+                else
+                {
+                    refTrigger.SetAttributeValue("DogTag", (string?)c.Attribute("DogTag") ?? "0");
+                    refTrigger.SetAttributeValue("EventId", modifiedId.ToString(CultureInfo.InvariantCulture));
+                    refTrigger.SetAttributeValue("Date", stamp);
+                }
             }
 
-            // Do not set the "built" flags (0x20000 | 0x40): without a real compiled image they only
-            // make the compiler skip the element and fail later.
             changed = true;
         }
 
