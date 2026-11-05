@@ -105,9 +105,19 @@ so it is a fresh TriStation project whose POUs came from the XML.
    - The element's own catalogue entry must carry its interface in `Collection Name="Declarations"`.
      TriStation compares an instance's snapshot pins with that collection when the project is
      opened; an inserted POU left it empty, so every instance of that type was "out of date"
-     and the editor drew a red diagonal slash across the block. `BuildProjectTypes` now
+     and the editor drew a red X across the block. `BuildProjectTypes` now
      rewrites the collection from the same interface pins used for the snapshots.
-   - A branch arm in the decomposed net that has fewer than two points is not a drawable wire.
+   - The interface includes the compiler temp pins (`_TEMP_BOOL_n`, `varVTType=4`). TriStation's
+     importer writes them and its editor compares them; omitting them also produces the red X.
+   - Library block snapshots must use the installed library's element IDs. The captured pin table
+     used to carry the older installation's DogTags (`AND=368`) while the project catalogue held
+     the installed ones (`AND=9`), so every library block resolved by name but was reported out of
+     date. `Resources/library_snapshots.json` is regenerated from the installed catalogue; IDs,
+     events and pin tables now match it.
+   - A project function block is written in the imported/compiled state: `ExtOptionFlags=3`, the
+     `0x6000 | 0x20000 | 0x40` flag bits, `EventCompiled` on the connections event and
+     `RefTrigger` pointing at the modification event. Without that state the editor also marks
+     the instances out of date.   - A branch arm in the decomposed net that has fewer than two points is not a drawable wire.
      TriStation rejects it as an overlapping segment (`WF0032`). Those arms are now suppressed;
      the block pin is stored as a direct link (`effectiveParam` = source expression,
      `connectId` = source element), which is how the importer stores zero-length links.
