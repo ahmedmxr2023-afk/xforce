@@ -207,6 +207,16 @@ app.MapPost("/convert", async (HttpRequest request) =>
                 contentBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(built.Report)),
             });
         }
+        if (!string.IsNullOrWhiteSpace(built.LintReport))
+        {
+            artifacts.Add(new
+            {
+                name = "pt2x_lint.txt",
+                mimeType = "text/plain",
+                kind = "report",
+                contentBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(built.LintReport!)),
+            });
+        }
         if (!string.IsNullOrWhiteSpace(ladderReport))
         {
             artifacts.Add(new
@@ -228,8 +238,21 @@ app.MapPost("/convert", async (HttpRequest request) =>
             });
         }
 
+        // The linter is the guard against editor-only defects that a successful build does not
+        // catch (stale library identities, out-of-date FB interfaces). Surface it on the job.
+        var warnings = new List<string>();
+        if (built.LintIssues > 0)
+        {
+            warnings.Add($"PT2X consistency check: {built.LintIssues} issue(s). TriStation may show out-of-date (red X) blocks; see pt2x_lint.txt.");
+            foreach (var message in (built.LintMessages ?? Array.Empty<string>()).Take(10))
+                warnings.Add(message);
+            if ((built.LintMessages?.Count ?? 0) > 10)
+                warnings.Add($"... and {(built.LintMessages!.Count - 10)} more (see pt2x_lint.txt).");
+        }
+
         PersistEvidence(evidenceDir,
             ("pt2x_build_report.txt", built.Report),
+            ("pt2x_lint.txt", built.LintReport),
             ("ladder_report.txt", ladderReport),
             ("simatic_report.txt", importReport));
 
@@ -239,8 +262,12 @@ app.MapPost("/convert", async (HttpRequest request) =>
             new
             {
                 artifacts,
-                warnings = Array.Empty<string>(),
-                summary = new Dictionary<string, object?> { ["target"] = "pt2x" },
+                warnings,
+                summary = new Dictionary<string, object?>
+                {
+                    ["target"] = "pt2x",
+                    ["lintIssues"] = built.LintIssues,
+                },
                 engineVersion = ConversionEngine.Version,
             },
             new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });

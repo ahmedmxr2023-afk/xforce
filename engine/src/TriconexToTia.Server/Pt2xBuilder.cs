@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 
 namespace TriconexToTia.Server;
 
@@ -16,12 +17,19 @@ namespace TriconexToTia.Server;
 /// </remarks>
 public static class Pt2xBuilder
 {
-    public sealed record Result(bool Success, byte[]? Bytes, string Report, string? Error);
+    public sealed record Result(
+        bool Success,
+        byte[]? Bytes,
+        string Report,
+        string? Error,
+        int LintIssues = 0,
+        IReadOnlyList<string>? LintMessages = null,
+        string? LintReport = null);
 
     private static readonly TimeSpan Timeout = TimeSpan.FromMinutes(
         double.TryParse(Environment.GetEnvironmentVariable("MSW_PT2CONV_TIMEOUT_MINUTES"), out var minutes) && minutes > 0
             ? minutes
-            : 5);
+            : 15);
 
     public static async Task<Result> BuildAsync(Stream xml, string sourceName, CancellationToken cancellationToken)
     {
@@ -90,7 +98,14 @@ public static class Pt2xBuilder
             }
 
             var bytes = await File.ReadAllBytesAsync(outPath, cancellationToken);
-            return new Result(true, bytes, report.ToString(), null);
+            var lint = await RunLintAsync(executable, outPath, cancellationToken);
+            if (lint != null)
+            {
+                report.AppendLine();
+                report.AppendLine(lint.Report);
+            }
+            return new Result(true, bytes, report.ToString(), null,
+                lint?.Issues ?? 0, lint?.Messages, lint?.Report);
         }
         catch (Exception exception)
         {
@@ -99,6 +114,73 @@ public static class Pt2xBuilder
         finally
         {
             try { Directory.Delete(work, true); } catch { /* best effort */ }
+        }
+    }
+
+    private sealed record LintResult(int Issues, IReadOnlyList<string> Messages, string Report);
+
+    /// <summary>
+    /// Runs the container consistency guard on the produced file. Non-zero issues mean the
+    /// editor will draw out-of-date (red X) blocks even though the container is valid; the
+    /// conversion still succeeds, but the caller surfaces the findings as warnings.
+    /// </summary>
+    private static async Task<LintResult?> RunLintAsync(string executable, string pt2xPath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = executable,
+                WorkingDirectory = Path.GetDirectoryName(pt2xPath) ?? ".",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            startInfo.ArgumentList.Add("lint");
+            startInfo.ArgumentList.Add(pt2xPath);
+            startInfo.ArgumentList.Add("--json");
+
+            using var process = new Process { StartInfo = startInfo };
+            if (!process.Start()) return null;
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromMinutes(2));
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(timeout.Token);
+            var stderrTask = process.StandardError.ReadToEndAsync(timeout.Token);
+            try
+            {
+                await process.WaitForExitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                try { process.Kill(entireProcessTree: true); } catch { /* best effort */ }
+                return null;
+            }
+
+            string stdout = await stdoutTask;
+            string stderr = await stderrTask;
+            if (stdout.Trim().Length == 0) return null;
+
+            using var doc = JsonDocument.Parse(stdout.Trim());
+            int issues = doc.RootElement.TryGetProperty("errors", out var e) ? e.GetInt32() : 0;
+            var messages = new List<string>();
+            if (doc.RootElement.TryGetProperty("messages", out var list) && list.ValueKind == JsonValueKind.Array)
+                foreach (var item in list.EnumerateArray())
+                {
+                    string? message = item.GetString();
+                    if (!string.IsNullOrWhiteSpace(message)) messages.Add(message);
+                }
+
+            string report = issues == 0
+                ? "lint: 0 issue(s)"
+                : "lint: " + issues + " issue(s)" + Environment.NewLine
+                  + string.Join(Environment.NewLine, messages.Select(m => "  X " + m));
+            return new LintResult(issues, messages, report);
+        }
+        catch
+        {
+            return null;
         }
     }
 
