@@ -67,8 +67,10 @@ and hardware from one chassis to replicated multi-chassis configurations.
 ```powershell
 dotnet pt2conv.dll check  project.xml            # human report (exit 0 convertible / 3 blocked)
 dotnet pt2conv.dll check  project.xml --json     # machine-readable report (canConvert, counts, blockers…)
-dotnet pt2conv.dll buildxml project.xml out.pt2x # refuses blocked input (--force overrides)
-dotnet pt2conv.dll buildxml project.xml out.pt2x --assume-multi-write
+dotnet pt2conv.dll buildxml project.xml out.pt2x
+dotnet pt2conv.dll lint out.pt2x                # snapshot/catalogue/library identity guard # refuses blocked input (--force overrides)
+dotnet pt2conv.dll buildxml project.xml out.pt2x
+dotnet pt2conv.dll lint out.pt2x                # snapshot/catalogue/library identity guard --assume-multi-write
 ```
 
 `--assume-multi-write` enables `EnableMultipleWrite` for tags that the XML shows

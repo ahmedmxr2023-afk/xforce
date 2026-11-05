@@ -83,6 +83,17 @@ foreach ($xmlPath in $Xml) {
   $ours = Join-Path $work "ours.pt2x"
   $build = & dotnet $tool buildxml $local $ours 2>&1 | Out-String
   $oursOk = Test-Path $ours
+  # Consistency guard: snapshot/catalogue/library identities. Non-zero means the editor would
+  # draw red X (out-of-date) markers even though TriStation may still compile the project.
+  $lintIssues = -1
+  if ($oursOk) {
+    $lintOut = & dotnet $tool lint $ours 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) { $lintIssues = 0 }
+    else {
+      $m = [regex]::Match($lintOut, '(\d+) issue\(s\)')
+      if ($m.Success) { $lintIssues = [int]$m.Groups[1].Value } else { $lintIssues = 999 }
+    }
+  }
 
   $oursCodes = @(); $oracleCodes = @(); $oracleOk = $false
 
@@ -129,6 +140,7 @@ foreach ($xmlPath in $Xml) {
     OursBuilt    = $oursOk
     OursErrors   = $oursCodes.Count
     OursCodes    = (($oursCodes | Group-Object | Sort-Object Count -Descending | Select-Object -First 4 | ForEach-Object { "$($_.Name)x$($_.Count)" }) -join ' ')
+    LintIssues   = $lintIssues
     OracleBuilt  = $oracleOk
     OracleErrors = $oracleCodes.Count
     OracleCodes  = (($oracleCodes | Group-Object | Sort-Object Count -Descending | Select-Object -First 4 | ForEach-Object { "$($_.Name)x$($_.Count)" }) -join ' ')
@@ -145,7 +157,7 @@ $golden = $results | ForEach-Object {
   [pscustomobject]@{
     project = $_.Project
     preflight = $_.Preflight
-    ours = @{ built = [bool]$_.OursBuilt; errors = [int]$_.OursErrors; codes = $_.OursCodes }
+    ours = @{ built = [bool]$_.OursBuilt; errors = [int]$_.OursErrors; codes = $_.OursCodes; lintIssues = [int]$_.LintIssues }
     oracle = @{ built = [bool]$_.OracleBuilt; errors = [int]$_.OracleErrors; codes = $_.OracleCodes }
   }
 }

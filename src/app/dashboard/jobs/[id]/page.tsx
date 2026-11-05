@@ -174,6 +174,16 @@ export default async function JobDetailPage({ params }: PageProps<"/dashboard/jo
                   </a>
                 </div>
               ) : null}
+              {targetRaw === "pt2x" ? (
+                <div className="mt-4">
+                  <Link
+                    href="/guides/tristation"
+                    className="inline-flex items-center gap-2 text-xs font-semibold text-signal-300 underline-offset-4 hover:underline"
+                  >
+                    How to open this PT2X in TriStation
+                  </Link>
+                </div>
+              ) : null}
             </div>
           </div>
         </div>

@@ -52,6 +52,7 @@ public static class Program
                 "findtemplate" => FindTemplate.Run(args),
                 "base" => BaseCmd(args),
                 "check" => Capabilities.Run(args),
+                "lint" => Lint.Run(args),
                 "stlist" => StList.Run(args),
                 "help" or "-h" or "--help" => PrintUsageSafe(),
                 _ => PrintUnknown(args[0]),
@@ -91,7 +92,7 @@ public static class Program
     {
         Console.WriteLine(
 """
-pt2conv — OLE/CFB (TriStation .pt2/.pt2x) container tool and PLCopen-XML build tool.
+pt2conv â€” OLE/CFB (TriStation .pt2/.pt2x) container tool and PLCopen-XML build tool.
 
 Commands:
   extract <file.pt2x> <outdir>          Extract every stream to <outdir> (hierarchy preserved)
@@ -131,6 +132,7 @@ Commands:
   findtemplate <xml> <searchDir>        Find a .pt2x whose POU catalog matches the XML.
   base <out.pt2x> | base --extract [dir]  Emit/extract the embedded generic base project.
   check <xml>                           Pre-flight: report what the builder cannot convert.
+  lint <project.pt2x> [--json]         Consistency guard: snapshot/catalogue/library identity (red-X causes).
 """);
     }
 
@@ -289,7 +291,7 @@ Commands:
             else
             {
                 mismatch++;
-                Console.WriteLine($"  CRC MISMATCH: {kv.Key}  stored={want[..16]}… got={got[..16]}…");
+                Console.WriteLine($"  CRC MISMATCH: {kv.Key}  stored={want[..16]}â€¦ got={got[..16]}â€¦");
             }
         }
         int orphan = crcs.Count(kv => !data.ContainsKey(kv.Key));
@@ -349,7 +351,7 @@ Commands:
         const string src = @"C:\XforceMsw\pt2-study\runA_COPY.PT2X";
         const string work = @"C:\XforceMsw\pt2-conv\work";
 
-        Console.Write("1. extract … ");
+        Console.Write("1. extract â€¦ ");
         if (Directory.Exists(work)) Directory.Delete(work, true);
         Directory.CreateDirectory(work);
         var cf = CompoundFile.Open(src);
@@ -362,7 +364,7 @@ Commands:
         }
         Console.WriteLine($"{orig.Count} streams");
 
-        Console.Write("2. rebuild (recompute crc) … ");
+        Console.Write("2. rebuild (recompute crc) â€¦ ");
         var tree = new List<(string, byte[])>();
         foreach (var s in orig)
         {
@@ -374,12 +376,12 @@ Commands:
         CompoundFileWriter.Write(outFile, onDisk);
         Console.WriteLine($"{outFile} ({new FileInfo(outFile).Length:N0} B)");
 
-        Console.Write("3. re-extract rebuilt … ");
+        Console.Write("3. re-extract rebuilt â€¦ ");
         var cf2 = CompoundFile.Open(outFile);
         var rebuilt = cf2.ListStreams();
         Console.WriteLine($"{rebuilt.Count} streams");
 
-        Console.Write("4. compare all streams … ");
+        Console.Write("4. compare all streams â€¦ ");
         var d1 = orig.ToDictionary(x => x.Path, x => x.Data, StringComparer.OrdinalIgnoreCase);
         var d2 = rebuilt.ToDictionary(x => x.Path, x => x.Data, StringComparer.OrdinalIgnoreCase);
         int added = d2.Keys.Where(k => !d1.ContainsKey(k)).Count();
@@ -397,7 +399,7 @@ Commands:
                 Console.WriteLine($"   EXTRA {k}");
         }
 
-        Console.Write("5. verify rebuilt _crc … ");
+        Console.Write("5. verify rebuilt _crc â€¦ ");
         var data = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         var crcs = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         foreach (var s in rebuilt)

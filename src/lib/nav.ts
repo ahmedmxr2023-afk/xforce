@@ -16,4 +16,5 @@ export const PRODUCT_LINKS: NavItem[] = [
   { href: "/dashboard/jobs", label: "Job history" },
   { href: "/dashboard/licenses", label: "Licenses" },
   { href: "/dashboard/billing", label: "Billing" },
+  { href: "/guides/tristation", label: "Open in TriStation" },
 ];
