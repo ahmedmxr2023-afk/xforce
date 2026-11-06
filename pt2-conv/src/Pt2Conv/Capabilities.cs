@@ -68,11 +68,10 @@ public static class Capabilities
                 .GroupBy(p => (string)p.Attribute("name")!, StringComparer.OrdinalIgnoreCase)
                 .Count(g => g.Count() > 1);
             if (duplicatedNames > 0)
-                report.Blockers.Add($"Exported by TriStation {versionText}: {duplicatedNames} element(s) are stored "
-                                    + "twice (the 4.x exporter wrote each diagram copy as a separate POU). TriStation 5.8 "
-                                    + "merges the copies onto the same sheets and reports WF0032 (wire segments or links "
-                                    + "overlap) on every shared sheet; its own XML importer fails the same way. Re-export "
-                                    + "from TriStation 5.8 or remove the duplicate POU definitions before converting.");
+                report.Warnings.Add($"Exported by TriStation {versionText}: {duplicatedNames} element(s) are stored twice "
+                                    + "(the 4.x exporter wrote each diagram copy as a separate POU). The builder keeps one "
+                                    + "copy and writes a single diagram; merging both, which is what 5.8 does on import, "
+                                    + "overlays the sheets and fails with WF0032.");
         }
 
         var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -155,7 +154,7 @@ public static class Capabilities
             if (dangling.Count > 0)
                 report.Warnings.Add($"{dangling.Count} variable placement(s) are not connected to any network element "
                                     + $"({string.Join(", ", dangling.Take(12))}{(dangling.Count > 12 ? " …" : "")}); "
-                                    + "TriStation may report WG0001 for them when the program is built.");
+                                    + "they are dropped from the diagram because TriStation reports WG0001 for them.");
         }
         catch { }
 

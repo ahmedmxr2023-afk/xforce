@@ -918,6 +918,32 @@ public static partial class FbdGenerator
             }
         }
 
+        // A placement with no incoming connection and no connection referencing it cannot carry
+        // any logic, yet TriStation still compiles it and reports WG0001 ("not connected to any
+        // other network element"). Older exports are full of stray variables left on the sheet.
+        // Drop the drawing item; the declaration stays, only the unused placement goes away.
+        // Placements whose localId is reused across diagram copies are left alone (resolving an
+        // id that appears more than once could remove a connected copy).
+        var idCounts = p.ElemOrder.Where(e => e.ExportId >= 0)
+            .GroupBy(e => e.ExportId).ToDictionary(g => g.Key, g => g.Count());
+        var wiredIds = new HashSet<int>(p.ConnOrder.Select(x => x.SrcExportId));
+        var dangling = p.Placements
+            .Where(v => v.InConn == null && v.ExportId >= 0
+                        && idCounts.TryGetValue(v.ExportId, out int n) && n == 1
+                        && !wiredIds.Contains(v.ExportId))
+            .ToList();
+        if (dangling.Count > 0)
+        {
+            foreach (var v in dangling)
+            {
+                p.Placements.Remove(v);
+                p.ElemOrder.Remove(v);
+                p.ByExportId.Remove(v.ExportId);
+            }
+            Console.WriteLine($"  {p.Name}: dropped {dangling.Count} unconnected placement(s) "
+                              + $"({string.Join(", ", dangling.Select(v => v.Expression).Where(n => n.Length > 0).Distinct().Take(8))})");
+        }
+
         // Function-block instances used in the body are declared in the FBD's
         // declarations collection even when they are not named in <globalVars>.
         var declared = new HashSet<string>(p.Vars.Select(v => v.Name), StringComparer.Ordinal);

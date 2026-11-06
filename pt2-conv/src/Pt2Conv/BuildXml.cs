@@ -164,6 +164,14 @@ public static class BuildXml
         var doc = XmlRepair.Load(xmlPath);
         var pouEls = doc.Descendants().Where(e => e.Name.LocalName == "pou").ToList();
 
+        // TriStation 4.x stored each element twice as two identical <pou> elements. 5.8 marks a
+        // stored diagram copy with a ts:diagramCopies=2 comment instead, so duplicates from an
+        // older producer must not be re-duplicated in the output (see the generation loop).
+        string producerVersion = (string?)doc.Descendants()
+            .FirstOrDefault(e => e.Name.LocalName == "fileHeader")?.Attribute("productVersion") ?? "";
+        bool legacyDuplicateCopies = int.TryParse(producerVersion.Split('.')[0], out int producerMajor)
+                                     && producerMajor > 0 && producerMajor < 5;
+
         var referencedTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var e in doc.Descendants())
         {
@@ -290,6 +298,12 @@ public static class BuildXml
                     || pouEls.Any(e => string.Equals((string?)e.Attribute("name"), pou, StringComparison.OrdinalIgnoreCase)
                                        && e.Nodes().OfType<System.Xml.Linq.XComment>()
                                            .Any(c => c.Value.Contains("ts:diagramCopies=2", StringComparison.Ordinal)));
+                // TriStation 4.x exports repeat the whole element (two identical <pou> elements,
+                // each already carrying every sheet) instead of marking the stored diagram copy
+                // with ts:diagramCopies=2. Writing both copies again doubles the sheets and makes
+                // 5.8 reject the element with WF0032. One POU plus a single diagram is the
+                // representation 5.8 accepts, so drop the duplicate.
+                if (legacyDuplicateCopies) duplicated = false;
                 byte[] gen = lang == "FBD"
                     ? FbdGenerator.GenerateBytes(xmlPath, emitName, tagDesc, referencedTypes, CountSheets(tree[target].Data), duplicated, projectTypes)
                     : StGenerator.Generate(xmlPath, emitName);
