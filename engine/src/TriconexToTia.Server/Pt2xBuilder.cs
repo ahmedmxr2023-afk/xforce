@@ -145,9 +145,9 @@ public static class Pt2xBuilder
             if (!process.Start()) return null;
 
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromMinutes(2));
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(timeout.Token);
-            var stderrTask = process.StandardError.ReadToEndAsync(timeout.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(30));
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
             try
             {
                 await process.WaitForExitAsync(timeout.Token);
@@ -155,6 +155,7 @@ public static class Pt2xBuilder
             catch (OperationCanceledException)
             {
                 try { process.Kill(entireProcessTree: true); } catch { /* best effort */ }
+                try { await Task.WhenAll(stdoutTask, stderrTask); } catch { /* best effort */ }
                 return null;
             }
 

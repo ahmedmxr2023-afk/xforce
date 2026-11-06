@@ -54,6 +54,31 @@ builder.Services.Configure<FormOptions>(form =>
 var app = builder.Build();
 var engine = new ConversionEngine();
 
+// Always answer with a JSON body, even for an unhandled exception. Without this the client sees
+// a bare 500 with no diagnostic, which is impossible to support from the website.
+app.Use(async (context, next) =>
+{
+    try
+    {
+        await next();
+    }
+    catch (Exception exception)
+    {
+        if (context.Response.HasStarted)
+        {
+            throw;
+        }
+        context.Response.Clear();
+        context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsJsonAsync(new
+        {
+            error = "Engine exception: " + exception.Message,
+            detail = exception.ToString(),
+        });
+    }
+});
+
 // Building an openable TIA project needs Siemens Openness, which only exists where TIA Portal is
 // installed. When it is absent (e.g. the hosted Linux engine) POST /convert/project is refused and
 // the plain package endpoint is used instead. TIA is single-instance, so imports are serialised.
