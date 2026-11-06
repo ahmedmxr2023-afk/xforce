@@ -508,9 +508,11 @@ app.MapGet("/api/progress/{id}", (string id, HttpRequest request) =>
 // to the evidence reports. Empty (not an error) when no directory is configured.
 app.MapGet("/api/history", (HttpRequest request) =>
 {
-    if (!TryResolveDirs(request, out var output, out _, out var error))
+    // History is optional: an engine without MSW_OUTPUT_DIR simply has no history to show.
+    // Returning an empty list keeps the dashboard quiet instead of logging a 400 on every poll.
+    if (!TryResolveDirs(request, out var output, out _, out _))
     {
-        return Results.Json(new { error }, statusCode: StatusCodes.Status400BadRequest);
+        return Results.Json(Array.Empty<object>(), statusJson);
     }
 
     var limit = int.TryParse(request.Query["limit"], out var parsed) ? parsed : 50;
