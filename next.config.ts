@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import { DOCUMENT_CACHE_CONTROL } from "./src/lib/cache-policy";
 
 /**
  * Version-skew guard.
@@ -23,6 +24,7 @@ const deploymentId =
   process.env.VERCEL_GIT_COMMIT_SHA ||
   undefined;
 
+
 const nextConfig: NextConfig = {
   deploymentId,
   serverExternalPackages: ["better-sqlite3"],
@@ -43,6 +45,13 @@ const nextConfig: NextConfig = {
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
           { key: "X-Frame-Options", value: "DENY" },
         ],
+      },
+      {
+        // The root document is prerendered, and proxy headers alone do not survive Next.js's
+        // route cache for it (verified against the deployed instance). Configuration headers
+        // are the documented override, so keep this explicit entry for the landing page.
+        source: "/",
+        headers: [{ key: "Cache-Control", value: DOCUMENT_CACHE_CONTROL }],
       },
     ];
   },
