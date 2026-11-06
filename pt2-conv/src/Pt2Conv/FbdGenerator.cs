@@ -1390,6 +1390,11 @@ public static partial class FbdGenerator
     /// consumes one id per path segment and keeps the last one (TriStation's edit-history
     /// gaps). Recomputes PrimarySpan/lastUniqueID from the last id.
     /// </summary>
+    /// <summary>
+    /// Assigns wire ids after the final geometry is known: per sheet, in plan order, a wire
+    /// consumes one id per path segment and keeps the last one (TriStation's edit-history
+    /// gaps). Recomputes PrimarySpan/lastUniqueID from the last id.
+    /// </summary>
     private static void AssignWireIds(Plan plan)
     {
         int next = plan.WireIdStart;
@@ -1411,6 +1416,29 @@ public static partial class FbdGenerator
             ? $"{a.X},{a.Y}|{b.X},{b.Y}" : $"{b.X},{b.Y}|{a.X},{a.Y}";
 
     private static (int X, int Y) Dir((int X, int Y) a, (int X, int Y) b) => (b.X - a.X, b.Y - a.Y);
+
+    /// <summary>
+    /// True when a connection endpoint lands on the named pin of the element. Exports from older
+    /// TriStation versions can carry connections whose stored path points at stale coordinates
+    /// (for example a horizontal stub at y=50 for a literal at y=15); the importer discards those,
+    /// so they must not be emitted as wires.
+    /// </summary>
+    private static bool EndpointAt(ExElem e, string pin, bool isSource, (int X, int Y) p)
+    {
+        if (e is ExBlock b)
+        {
+            int ry = isSource
+                ? b.Outputs.FirstOrDefault(o => o.Name == pin)?.RelY ?? 0
+                : b.Inputs.FirstOrDefault(i => i.Name == pin)?.RelY ?? 0;
+            // Outputs are drawn to the right of the box; relPosition x is not carried, so allow a
+            // wider x margin there while keeping y tight (pins are rows).
+            int dx = isSource ? 30 : 12;
+            return Math.Abs(p.X - (b.X - 1)) <= dx && Math.Abs(p.Y - (b.Y + ry)) <= 8;
+        }
+        if (e is ExVarPlace v)
+            return Math.Abs(p.X - (v.X + v.W)) <= 10 && Math.Abs(p.Y - (v.Y + v.H / 2)) <= 8;
+        return true;
+    }
 
     private static Plan BuildPlan(ExPou p)
     {
@@ -1481,7 +1509,19 @@ public static partial class FbdGenerator
             // plain variable keeps the direct pin link only; wiring that shape is rejected by the
             // compiler as "Feature not implemented".
             bool constToBlock = w.SourceVar != null && w.SourceVar.IsConstant && w.TargetIsBlockInput;
-            bool srcDrop = (w.SourceVar != null && w.SourceVar.IsConstant && !constToBlock) || degenerate;
+            // A literal that feeds a block input is normally a wire, but a lossy export can
+            // carry a stale path for that connection (e.g. a horizontal stub at y=127 while
+            // both elements sit at y=10..13). The importer drops such a path and stores a
+            // direct pin link instead; keeping the stub makes TriStation report WF0032
+            // ("wire segments or links overlap") because several constants share the same
+            // bogus coordinates. Detect that shape by requiring each path end to be near the
+            // element it claims to connect.
+            bool pathReachesElements = c.Path.Count < 2
+                || (EndpointAt(src, w.SourcePin, true, c.Path[^1])
+                    && EndpointAt(tgt, w.TargetPin, false, c.Path[0]));
+            bool constToBlockDirect = constToBlock && !pathReachesElements;
+            bool srcDrop = ((w.SourceVar != null && w.SourceVar.IsConstant && !constToBlock) || degenerate)
+                           || constToBlockDirect;
             bool tgtDrop = w.TargetVar != null && w.TargetVar.IsConstant && w.TargetVar.Kind != "in";
             if (srcDrop || tgtDrop) w.Suppress = true;
             if (degenerate && (w.SourceVar == null || !w.SourceVar.IsConstant)) w.Drop = true;
@@ -2133,13 +2173,20 @@ public static partial class FbdGenerator
 
         // declarations
         sb.Append("<Collection Name=\"declarations\" ClassType=\"CTS2Vars\" CollectionType=\"1\">");
+        // A program's <globalVars> section can name variables that never appear in the project
+        // tag table. TriStation 4.x exports use that section for program-scope variables as
+        // well as for genuine globals. Writing such a name as a global declaration makes
+        // TriStation resolve it against the tag database and fail the build with WF0078; as a
+        // plain VAR it is a normal program-local declaration, which is what the source held.
+        bool IsResolvedGlobal(ExVar v) =>
+            v.Section == "global" && (p.TagDesc == null || p.TagDesc.ContainsKey(v.Name));
         // Programs list every referenced global tag first (sorted case-sensitively), then all
         // remaining declarations (locals + function-block instances) sorted together.
         // Function blocks keep their interface order.
         IEnumerable<ExVar> declOrder = p.Vars;
         if (p.PouType == "program")
-            declOrder = p.Vars.Where(v => !v.IsInstance && v.Section == "global").OrderBy(v => v.Name, StringComparer.Ordinal)
-                .Concat(p.Vars.Where(v => v.IsInstance || v.Section != "global").OrderBy(v => v.Name, StringComparer.Ordinal));
+            declOrder = p.Vars.Where(v => !v.IsInstance && IsResolvedGlobal(v)).OrderBy(v => v.Name, StringComparer.Ordinal)
+                .Concat(p.Vars.Where(v => v.IsInstance || !IsResolvedGlobal(v)).OrderBy(v => v.Name, StringComparer.Ordinal));
         foreach (var v in declOrder)
         {
             var places = p.Placements.Where(x => x.Expression == v.Name).ToList();
@@ -2147,7 +2194,7 @@ public static partial class FbdGenerator
             // to use it: a local (or inOut) that is only ever written is still a local inOut
             // (3), not an output (1). Reference FBDs confirm this for every POU.
             string vt;
-            if (v.Section == "global") vt = "5";
+            if (IsResolvedGlobal(v)) vt = "5";
             else if (v.IsInstance) vt = "3";
             else vt = v.Section switch { "input" => "0", "output" => "1", _ => "3" };
             // Instances of library elements inside a POU that is actually referenced (built)
@@ -2168,7 +2215,7 @@ public static partial class FbdGenerator
             string fbrc = v.IsInstance ? refCount.ToString() : "0";
             string desc = v.Doc;
             string dataType = v.IsInstance ? v.Derived : v.DataType;
-            if (v.Section == "global")
+            if (IsResolvedGlobal(v))
             {
                 if (p.TagDesc != null && p.TagDesc.TryGetValue(v.Name, out var ti))
                 {

@@ -32,6 +32,9 @@ dotnet pt2conv.dll buildxml project.xml project.pt2x
 | `<derived>` type that is neither a POU in the file nor a library element | **blocked** | Usually a UDT or a missing project POU. |
 | Foreign exports (SimaticML, CODESYS, …) | **blocked** | `productName`/namespace is checked. SimaticML can be translated first with `pt2conv fromsimatic`. |
 | Unknown block type (not in the library, not defined in the file) | **blocked** | Would open as an error block in TriStation. |
+| TriStation 4.x export that stores each element twice (`<pou>` duplicated) | **blocked** | 5.8 merges the copies onto the same sheets and reports `WF0032`; its own importer fails identically. Re-export from 5.8. |
+| Program-scope variables in a program's `<globalVars>` that are not in the tag table | supported | Written as program-local `VAR`; declaring them as globals makes 5.8 report `WF0078` (unresolved tagname). |
+| Constant → block-input connection whose exported path points at stale coordinates | supported | Written as a direct pin link, the way 5.8's importer stores it; emitting the stale stub causes `WF0032`. |
 | POU with no body | warning | Kept as a declaration only. |
 | More than one configuration / task | warning | Only the first execution list is carried over. |
 | Cause & Effect (CEM) data | warning | Not converted. |

@@ -52,6 +52,29 @@ public static class Capabilities
         if (rootNs.Length > 0 && rootNs != "http://www.plcopen.org/xml/tc6.xsd" && rootNs != "http://www.triconex.com/controller/03/2008")
             report.Blockers.Add($"Unexpected document namespace '{rootNs}' (expected PLCopen TC6 or TriStation).");
 
+        // TriStation 4.x exports store every element twice as two identical <pou> elements (one
+        // per stored diagram copy). TriStation 5.8 merges them into one element, overlays the
+        // copies on the same sheets and reports WF0032 "wire segments or links overlap" on every
+        // sheet that carries logic. Verified against 5.8's own importer: it fails identically, so
+        // the export cannot be turned into a build-clean 5.8 project without editing the diagram.
+        // 5.8 exports express the second copy with a ts:diagramCopies=2 comment instead, so only
+        // older producers are affected.
+        string versionText = (string?)header?.Attribute("productVersion") ?? "";
+        int versionMajor = int.TryParse(versionText.Split('.')[0], out int vm) ? vm : 0;
+        if (versionMajor > 0 && versionMajor < 5)
+        {
+            int duplicatedNames = pous
+                .Where(p => !string.IsNullOrEmpty((string?)p.Attribute("name")))
+                .GroupBy(p => (string)p.Attribute("name")!, StringComparer.OrdinalIgnoreCase)
+                .Count(g => g.Count() > 1);
+            if (duplicatedNames > 0)
+                report.Blockers.Add($"Exported by TriStation {versionText}: {duplicatedNames} element(s) are stored "
+                                    + "twice (the 4.x exporter wrote each diagram copy as a separate POU). TriStation 5.8 "
+                                    + "merges the copies onto the same sheets and reports WF0032 (wire segments or links "
+                                    + "overlap) on every shared sheet; its own XML importer fails the same way. Re-export "
+                                    + "from TriStation 5.8 or remove the duplicate POU definitions before converting.");
+        }
+
         var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var e in doc.Descendants())
         {
@@ -104,6 +127,38 @@ public static class Capabilities
                 report.Blockers.Add($"'{name}' is a {pt}; only programs and function blocks are supported.");
         }
 
+        // A drawn variable placement with no connection on either side makes the compiler report
+        // WG0001 ("'X' is not connected to any other network element"). It is a drawing defect,
+        // not something the builder can infer a connection for, so surface it before the build.
+        try
+        {
+            var referencedIds = new HashSet<string>(doc.Descendants()
+                .Where(e => e.Name.LocalName == "connection")
+                .Select(e => (string?)e.Attribute("refLocalId"))
+                .Where(v => !string.IsNullOrEmpty(v))
+                .Select(v => v!), StringComparer.Ordinal);
+            var dangling = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pou in pous)
+            {
+                var bodyEl = pou.Elements().FirstOrDefault(e => e.Name.LocalName == "body");
+                if (bodyEl == null) continue;
+                foreach (var v in bodyEl.Descendants().Where(e =>
+                             e.Name.LocalName is "inVariable" or "inOutVariable" or "outVariable"))
+                {
+                    string id = (string?)v.Attribute("localId") ?? "";
+                    if (id.Length == 0 || referencedIds.Contains(id)) continue;
+                    if (v.Descendants().Any(d => d.Name.LocalName == "connection")) continue;
+                    string name = (v.Elements().FirstOrDefault(e => e.Name.LocalName == "expression")?.Value ?? "").Trim();
+                    if (name.Length > 0 && FbdGenerator.IsDeclarableName(name)) dangling.Add(name);
+                }
+            }
+            if (dangling.Count > 0)
+                report.Warnings.Add($"{dangling.Count} variable placement(s) are not connected to any network element "
+                                    + $"({string.Join(", ", dangling.Take(12))}{(dangling.Count > 12 ? " …" : "")}); "
+                                    + "TriStation may report WG0001 for them when the program is built.");
+        }
+        catch { }
+
         // User-defined data types are not converted. PLCopen stores them under types/dataTypes;
         // usage also shows up as a <derived> reference that is neither a POU nor a library type.
         report.DataTypes = doc.Descendants().Count(e => e.Name.LocalName == "dataType");
@@ -121,18 +176,48 @@ public static class Capabilities
 
         // Programs can reference globals that have no TAGNAME declaration. TriStation itself
         // cannot resolve those (WF0078), so refuse them instead of inventing tags.
+        //
+        // Resolution must be scoped: a program exports its own program-scope variables inside
+        // <interface>/<globalVars> (older exports put tags there that never appear in the
+        // project-level tag table). Treating those declarations as references made every such
+        // export look like it had hundreds of undeclared tags. Body expressions are therefore
+        // resolved against the program's own interface plus the project-level tag table.
         try
         {
-            var text = File.ReadAllText(xmlPath);
-            var declared = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(text, "(?s)<variable\\s+name=\"([^\"]+)\">(.*?)</variable>"))
-                if (m.Groups[2].Value.Contains("TAGNAME", StringComparison.Ordinal)) declared.Add(m.Groups[1].Value);
-            var referenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (System.Text.RegularExpressions.Match p in System.Text.RegularExpressions.Regex.Matches(text, "(?s)<pou\\s+name=\"[^\"]+\"[^>]*pouType=\"program\"[^>]*>(.*?)</pou>"))
-                foreach (System.Text.RegularExpressions.Match g in System.Text.RegularExpressions.Regex.Matches(p.Groups[1].Value, "(?s)<globalVars[^>]*>(.*?)</globalVars>"))
-                    foreach (System.Text.RegularExpressions.Match v in System.Text.RegularExpressions.Regex.Matches(g.Groups[1].Value, "<variable\\s+name=\"([^\"]+)\""))
-                        referenced.Add(v.Groups[1].Value);
-            var missing = referenced.Where(n => !declared.Contains(n) && FbdGenerator.IsDeclarableName(n)).OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+            var globalTags = new HashSet<string>(
+                doc.Descendants()
+                   .Where(e => e.Name.LocalName == "globalVars"
+                               && !e.Ancestors().Any(a => a.Name.LocalName == "pou"))
+                   .SelectMany(g => g.Elements().Where(v => v.Name.LocalName == "variable"))
+                   .Select(v => (string?)v.Attribute("name"))
+                   .Where(n => !string.IsNullOrEmpty(n))
+                   .Select(n => n!),
+                StringComparer.OrdinalIgnoreCase);
+
+            var missing = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var program in pous.Where(p => string.Equals(
+                         (string?)p.Attribute("pouType"), "program", StringComparison.OrdinalIgnoreCase)))
+            {
+                var declaredHere = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var v in program.Descendants()
+                             .Where(e => e.Name.LocalName == "interface")
+                             .SelectMany(i => i.Descendants())
+                             .Where(e => e.Name.LocalName == "variable"))
+                {
+                    string? n = (string?)v.Attribute("name");
+                    if (!string.IsNullOrEmpty(n)) declaredHere.Add(n);
+                }
+
+                var bodyEl = program.Elements().FirstOrDefault(e => e.Name.LocalName == "body");
+                if (bodyEl == null) continue;
+                foreach (var expr in bodyEl.Descendants().Where(e => e.Name.LocalName == "expression"))
+                {
+                    string name = (expr.Value ?? "").Trim();
+                    if (!FbdGenerator.IsDeclarableName(name)) continue;
+                    if (!declaredHere.Contains(name) && !globalTags.Contains(name)) missing.Add(name);
+                }
+            }
+
             if (missing.Count > 0)
                 report.Blockers.Add($"{missing.Count} tag(s) are referenced by programs but have no declaration: "
                                     + string.Join(", ", missing.Take(12)) + (missing.Count > 12 ? $" … (+{missing.Count - 12})" : ""));
