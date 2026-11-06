@@ -1,5 +1,7 @@
 "use client";
 
+import { isChunkLoadFailure, reloadDocument } from "@/lib/chunk-recovery";
+
 // Last-resort boundary: replaces the root layout when the layout itself throws. Because it
 // stands in for layout.tsx it must render its own <html>/<body>, and it cannot rely on the
 // app stylesheet, so the styling here is intentionally inline and self-contained.
@@ -10,6 +12,8 @@ export default function GlobalError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  const staleBuild = isChunkLoadFailure(error);
+
   return (
     <html lang="en">
       <body
@@ -31,20 +35,21 @@ export default function GlobalError({
             ERROR
           </p>
           <h1 style={{ marginTop: "0.75rem", fontSize: "1.35rem", fontWeight: 600 }}>
-            The application failed to load
+            {staleBuild ? "A new version of the site is available" : "The application failed to load"}
           </h1>
           <p style={{ margin: "0.75rem auto 0", maxWidth: "28rem", fontSize: "0.875rem", lineHeight: 1.6, color: "#9aa7b4" }}>
-            A server error occurred before the page could render. Try again; if it persists, share
-            the reference below with support.
+            {staleBuild
+              ? "This tab is still running files from a previous release. Reloading fetches the current version."
+              : "A server error occurred before the page could render. Try again; if it persists, share the reference below with support."}
           </p>
-          {error.digest ? (
+          {!staleBuild && error.digest ? (
             <p style={{ marginTop: "1rem", fontFamily: "monospace", fontSize: "0.75rem", color: "#6b7a89" }}>
               Reference: {error.digest}
             </p>
           ) : null}
           <button
             type="button"
-            onClick={reset}
+            onClick={staleBuild ? reloadDocument : reset}
             style={{
               marginTop: "1.5rem",
               cursor: "pointer",
@@ -57,7 +62,7 @@ export default function GlobalError({
               borderRadius: "0.5rem",
             }}
           >
-            Reload
+            {staleBuild ? "Reload" : "Try again"}
           </button>
         </div>
       </body>

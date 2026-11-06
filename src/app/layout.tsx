@@ -1,6 +1,8 @@
 import type { Metadata, Viewport } from "next";
+import Script from "next/script";
 import { Geist, Geist_Mono } from "next/font/google";
 import { appUrl, siteName } from "@/lib/env";
+import { chunkRecoveryScript } from "@/lib/chunk-recovery";
 import "./globals.css";
 
 const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
@@ -74,7 +76,16 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       data-scroll-behavior="smooth"
       suppressHydrationWarning
     >
-      <body className="min-h-full flex flex-col bg-ink-950 text-mist-200">{children}</body>
+      <body className="min-h-full flex flex-col bg-ink-950 text-mist-200">
+        {/* Registered before hydration so a stale `/_next/static` chunk from a previous
+            deployment cannot leave the tab on a dead screen. See src/lib/chunk-recovery.ts. */}
+        <Script
+          id="chunk-recovery"
+          strategy="beforeInteractive"
+          dangerouslySetInnerHTML={{ __html: chunkRecoveryScript }}
+        />
+        {children}
+      </body>
     </html>
   );
 }
