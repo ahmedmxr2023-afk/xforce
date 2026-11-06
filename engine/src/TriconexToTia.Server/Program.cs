@@ -97,6 +97,7 @@ app.MapGet("/health", () => Results.Json(new
 {
     ready = true,
     engineVersion = ConversionEngine.Version,
+    build = Environment.GetEnvironmentVariable("RAILWAY_GIT_COMMIT_SHA") ?? "dev",
     converter = "triconex-to-tia",
     maxUploadBytes,
     tiaImport = new
