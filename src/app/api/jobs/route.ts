@@ -50,7 +50,14 @@ export async function POST(request: Request) {
   let form: FormData;
   try {
     form = await request.formData();
-  } catch {
+  } catch (error) {
+    // A truncated multipart body (proxy body cap, interrupted upload) lands here. Log the
+    // real cause so it is not silently reported as a generic client error.
+    console.error("[/api/jobs] multipart parse failed", {
+      contentType: request.headers.get("content-type"),
+      contentLength: request.headers.get("content-length"),
+      error: error instanceof Error ? error.message : String(error),
+    });
     return NextResponse.json({ error: "Malformed upload." }, { status: 400 });
   }
 

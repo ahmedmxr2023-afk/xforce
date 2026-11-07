@@ -2299,6 +2299,7 @@ public static partial class FbdGenerator
         var plan = BuildPlan(p);
         plan.ProjectTypes = projectTypes;
         RetypeVariablesForConsumers(plan);
+        CoerceNumericTypes(plan);
         _ = _commentIds;
         ComputeLayout(plan);
         // The ST layout above uses the logical wires; the FBD document uses the editor's
@@ -2717,10 +2718,147 @@ public static partial class FbdGenerator
         => t.Length == 0 || t.Equals("BIT", StringComparison.OrdinalIgnoreCase)
            || t.StartsWith("ANY", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>An export can declare a variable with a type that contradicts every consumer
-    /// (e.g. BOOL variables wired into AIN's DINT/REAL pins). When a variable feeds only block
-    /// inputs that agree on one concrete type, adopt that type so the generated declarations and
-    /// constants are consistent. Variables used in generic bit logic are left alone.</summary>
+    /// <summary>Effective type produced by a MOVE block (pass-through of its input operand).
+    /// A literal adapts to the destination, so it never forces a type here.</summary>
+    private static string MoveInputType(Plan plan, ExBlock move)
+    {
+        var w = plan.Wires.FirstOrDefault(
+            x => x.TargetBlock == move && !x.IsBranch && x.TargetPin.Length > 0);
+        if (w == null) return "";
+        if (w.SourceVar != null)
+        {
+            if (w.SourceVar.IsConstant) return "";
+            var d = plan.P.Vars.FirstOrDefault(
+                x => x.Name.Equals(w.SourceVar.Expression, StringComparison.OrdinalIgnoreCase));
+            return d == null ? "" : (d.IsInstance ? d.Derived : d.DataType);
+        }
+        if (w.SourceBlock != null) return BlockOutputType(w.SourceBlock, w.SourcePin);
+        return "";
+    }
+
+    private static int TypeRank(string t)
+    {
+        if (t.Equals("BOOL", StringComparison.OrdinalIgnoreCase)
+            || t.Equals("BIT", StringComparison.OrdinalIgnoreCase)) return 0;
+        if (t.Equals("REAL", StringComparison.OrdinalIgnoreCase)
+            || t.Equals("LREAL", StringComparison.OrdinalIgnoreCase)) return 2;
+        if (t.Equals("SINT", StringComparison.OrdinalIgnoreCase)
+            || t.Equals("INT", StringComparison.OrdinalIgnoreCase)
+            || t.Equals("DINT", StringComparison.OrdinalIgnoreCase)
+            || t.Equals("USINT", StringComparison.OrdinalIgnoreCase)
+            || t.Equals("UINT", StringComparison.OrdinalIgnoreCase)
+            || t.Equals("UDINT", StringComparison.OrdinalIgnoreCase)) return 1;
+        return -1;
+    }
+
+    /// <summary>
+    /// Reconciles the numeric type of a signal chain with the concrete pin types it feeds.
+    /// 4.x accepted BOOL tags wired to AIN/MOVE/comparison pins that are REAL/DINT in 5.8;
+    /// the compiler rejects those implicit conversions (WC0039/WC0002/WC0032). Promote the
+    /// declarations consistently (BOOL -> DINT -> REAL) and report every change. Variables
+    /// that also participate in bit logic (AND/OR/NOT) are never promoted to a numeric type.
+    /// </summary>
+    private static void CoerceNumericTypes(Plan plan)
+    {
+        var p = plan.P;
+        var bitVars = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var w in plan.Wires)
+        {
+            if (w.SourceVar != null && w.TargetBlock != null)
+            {
+                string t = PinDataType(w.TargetBlock, w.TargetPin);
+                if (t.Equals("ANY_BIT", StringComparison.OrdinalIgnoreCase)
+                    || t.Equals("BIT", StringComparison.OrdinalIgnoreCase)) bitVars.Add(w.SourceVar.Expression);
+            }
+            if (w.TargetVar != null && w.SourceBlock != null)
+            {
+                string t = BlockOutputType(w.SourceBlock, w.SourcePin);
+                if (t.Equals("ANY_BIT", StringComparison.OrdinalIgnoreCase)
+                    || t.Equals("BIT", StringComparison.OrdinalIgnoreCase)) bitVars.Add(w.TargetVar.Expression);
+            }
+        }
+
+        ExVar? Decl(string name) => p.Vars.FirstOrDefault(
+            x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+        bool changed = true;
+        int rounds = 0;
+        while (changed && rounds++ < 16)
+        {
+            changed = false;
+            void TrySet(string name, string t, string why)
+            {
+                var d = Decl(name);
+                if (d == null || d.IsInstance) return;
+                if (d.Section is "input" or "output" or "inOut") return;
+                if (IsGenericType(t)) return;
+                int nr = TypeRank(t), cr = TypeRank(d.DataType);
+                if (nr <= cr) return; // only promote, never oscillate
+                if (bitVars.Contains(d.Name) && nr > 0) return;
+                Console.WriteLine($"  {p.Name}: coerced '{d.Name}' {d.DataType}->{t} ({why})");
+                d.DataType = t;
+                changed = true;
+            }
+
+            foreach (var w in plan.Wires.ToList())
+            {
+                // A variable feeding a concrete block input adopts that pin's type.
+                if (w.SourceVar != null && !w.SourceVar.IsConstant && w.TargetBlock != null)
+                {
+                    string t = PinDataType(w.TargetBlock, w.TargetPin);
+                    if (!IsGenericType(t)) TrySet(w.SourceVar.Expression, t, "consumer pin");
+                }
+                // A concrete block output (or a MOVE whose input is concrete) types its sink.
+                if (w.TargetVar != null && w.SourceBlock != null)
+                {
+                    string t = w.SourceBlock.TypeName.Equals("MOVE", StringComparison.OrdinalIgnoreCase)
+                        ? MoveInputType(plan, w.SourceBlock)
+                        : BlockOutputType(w.SourceBlock, w.SourcePin);
+                    if (t.Length == 0) t = BlockOutputType(w.SourceBlock, w.SourcePin);
+                    if (!IsGenericType(t)) TrySet(w.TargetVar.Expression, t, "assignment");
+                }
+                // A MOVE's input operand adopts the type of the variable it writes.
+                if (w.TargetBlock != null && w.SourceVar != null && !w.SourceVar.IsConstant
+                    && w.TargetBlock.TypeName.Equals("MOVE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var outW = plan.Wires.FirstOrDefault(
+                        x => x.SourceBlock == w.TargetBlock && !x.IsBranch && x.TargetVar != null);
+                    if (outW?.TargetVar != null)
+                    {
+                        var d = Decl(outW.TargetVar.Expression);
+                        if (d != null && !IsGenericType(d.DataType))
+                            TrySet(w.SourceVar.Expression, d.DataType, "move operand");
+                    }
+                }
+            }
+
+            // Numeric comparisons: if one operand is REAL, promote the others to REAL.
+            foreach (var b in p.Blocks)
+            {
+                if (!Lib.TryGetValue(b.TypeName, out var meta)) continue;
+                bool numericGeneric = meta.Pins.Any(pin => pin.Vt == 0
+                    && (pin.DataType.StartsWith("ANY_NOTE", StringComparison.OrdinalIgnoreCase)
+                        || pin.DataType.StartsWith("ANY_NUM", StringComparison.OrdinalIgnoreCase)
+                        || pin.DataType.StartsWith("ANY_REAL", StringComparison.OrdinalIgnoreCase)
+                        || pin.DataType.Equals("ANY", StringComparison.OrdinalIgnoreCase)));
+                if (!numericGeneric) continue;
+                var operands = plan.Wires.Where(x => x.TargetBlock == b && !x.IsBranch).ToList();
+                bool anyReal = operands.Any(x =>
+                {
+                    string t = x.SourceVar != null
+                        ? (x.SourceVar.IsConstant ? x.SourceVar.DataType : Decl(x.SourceVar.Expression)?.DataType ?? "")
+                        : (x.SourceBlock != null ? BlockOutputType(x.SourceBlock, x.SourcePin) : "");
+                    return t.Equals("REAL", StringComparison.OrdinalIgnoreCase)
+                        || t.Equals("LREAL", StringComparison.OrdinalIgnoreCase);
+                });
+                if (!anyReal) continue;
+                foreach (var x in operands)
+                    if (x.SourceVar != null && !x.SourceVar.IsConstant)
+                        TrySet(x.SourceVar.Expression, "REAL", "numeric comparison");
+            }
+        }
+    }
+
     private static void RetypeVariablesForConsumers(Plan plan)
     {
         var p = plan.P;

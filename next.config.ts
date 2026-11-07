@@ -35,6 +35,10 @@ const nextConfig: NextConfig = {
     serverActions: {
       bodySizeLimit: "2mb",
     },
+    // Next clones/buffers the request body when a proxy is present (src/proxy.ts). The
+    // default 10 MB silently truncates larger conversions, which surfaces as
+    // "Malformed upload." from request.formData(). Keep this above the 32 MB UI cap.
+    proxyClientMaxBodySize: "64mb",
   },
   async headers() {
     return [

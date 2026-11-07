@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Pt2Conv.Cfb;
 
@@ -386,8 +387,13 @@ public static class BuildXml
             }
         }
 
-        // Phase 2b: adopt the project's library binaries from the XML's LIBRARY_DATA blobs.
-        // TriStation embeds each library as a nested compound file; when the XML comes from a
+        // A program can use safety tags and still write a tag the source marked CONTROL. 5.8
+        // treats such a program as safety and rejects the write (PC0024), and it rejects two
+        // writes to the same tag (PC0005). Reclassify those tags as safety and allow multiple
+        // writers. Both facts are derived from the source tag metadata, not guessed.
+        RepairSafetyTagUsage(tree, doc);
+
+        // Phase 2b: adopt the project's library binaries from the XML's LIBRARY_DATA blobs.        // TriStation embeds each library as a nested compound file; when the XML comes from a
         // project whose libraries differ from the template's, the template binaries would link
         // the wrong (older) library. Same-size streams are left alone because TriStation keeps
         // its own copy for the current install.
@@ -525,6 +531,7 @@ public static class BuildXml
                 .ToList();
         // Some exports carry an empty (or missing) execution list. Without one TriStation stops
         // with WB0237, so fall back to scheduling every program the XML defines.
+        bool fromSource = names.Count > 0;
         if (names.Count == 0)
             names = xml.Descendants()
                 .Where(e => e.Name.LocalName == "pou")
@@ -554,6 +561,15 @@ public static class BuildXml
         names = names.Where(n => executable.Contains(n)).ToList();
         if (names.Count == 0) return;
 
+        // A single XML export can merge a safety application and a control application. Their
+        // program lists cannot both be scheduled on one controller: 5.8 reports PC0024/PC0005
+        // (a safety program writing a CONTROL tag, or two programs writing the same tag). When
+        // the source carried no execution list, schedule the first writer of each control tag
+        // and leave later conflicting programs in the project but unscheduled.
+        if (!fromSource && names.Count > 1)
+            names = FilterControlWriteConflicts(tree, xml, names);
+        if (names.Count == 0) return;
+
         int px = tree.FindIndex(t => t.Path.Equals("Current/Project.xml", StringComparison.OrdinalIgnoreCase));
         if (px < 0) return;
         XDocument doc;
@@ -579,9 +595,172 @@ public static class BuildXml
         tree[px] = ("Current/Project.xml", AddPou.SerializeProject(doc.Root!));
     }
 
-    /// <summary>Sets every hardware point's <c>Name</c> from the regenerated tag table (by its
-    /// <c>CC.SS.PP</c> address) and clears the names of points that carry no tag. Stale template
-    /// names would otherwise collide with the tag table when TriStation opens the project.</summary>
+    /// <summary>Reclassifies CONTROL tags that a safety program writes as safety tags, and
+    /// enables multiple writes for tags written by more than one placement. Derived from the
+    /// source tag metadata (Application, EnableMultipleWrite) and the POU bodies.</summary>
+    private static void RepairSafetyTagUsage(List<(string Path, byte[] Data)> tree, XDocument doc)
+    {
+        int ti = tree.FindIndex(t => t.Path.Equals("Current/Tagnames/Tagnames.csv", StringComparison.OrdinalIgnoreCase));
+        if (ti < 0) return;
+
+        // Source applications: root-level <variable name="X"><ts:TAGNAME><ts:TAG_DECLARATION Application=.../>
+        var application = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var v in doc.Descendants().Where(e => e.Name.LocalName == "variable"))
+        {
+            var tn = v.Elements().FirstOrDefault(e => e.Name.LocalName == "TAGNAME");
+            if (tn == null) continue;
+            var decl = tn.Elements().FirstOrDefault(e => e.Name.LocalName == "TAG_DECLARATION");
+            string name = (string?)v.Attribute("name") ?? "";
+            string app = (string?)decl?.Attribute("Application") ?? "";
+            if (name.Length > 0 && app.Length > 0) application[name] = app;
+        }
+        if (application.Count == 0) return;
+
+        var safetyWrites = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var writeCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        // A project whose tag table contains Safety tags compiles as a safety controller; a
+        // CONTROL tag written by one of its programs is then invalid (PC0024). The 4.x export
+        // can carry a few stale CONTROL classifications in such a project.
+        bool safetyProject = application.Values.Any(
+            v => v.Equals("Safety", StringComparison.OrdinalIgnoreCase));
+        foreach (var pou in doc.Descendants().Where(e => e.Name.LocalName == "pou"
+                     && string.Equals((string?)e.Attribute("pouType"), "program", StringComparison.OrdinalIgnoreCase)))
+        {
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var e in pou.Descendants().Where(x => x.Name.LocalName is "expression" or "ST"))
+                foreach (Match m in Regex.Matches(e.Value ?? "", "[A-Za-z_][A-Za-z0-9_]*"))
+                    used.Add(m.Value);
+            bool safety = used.Any(t => application.TryGetValue(t, out var a)
+                                        && a.Equals("Safety", StringComparison.OrdinalIgnoreCase));
+
+            foreach (var el in pou.Descendants().Where(e => e.Name.LocalName is "inOutVariable" or "outVariable" or "coil"))
+            {
+                var cpi = el.Elements().FirstOrDefault(e => e.Name.LocalName == "connectionPointIn");
+                if (cpi == null || !cpi.Descendants().Any(e => e.Name.LocalName == "connection")) continue;
+                string expr = el.Elements().FirstOrDefault(e => e.Name.LocalName == "expression")?.Value?.Trim() ?? "";
+                if (expr.Length == 0) continue;
+                writeCount[expr] = (writeCount.TryGetValue(expr, out int n) ? n : 0) + 1;
+                if ((safety || safetyProject) && application.TryGetValue(expr, out var app)
+                    && app.Equals("Control", StringComparison.OrdinalIgnoreCase))
+                    safetyWrites.Add(expr);
+            }
+        }
+        if (safetyWrites.Count == 0 && writeCount.Count == 0) return;
+
+        string[] lines;
+        try { lines = Encoding.UTF8.GetString(tree[ti].Data).Split('\n'); }
+        catch { return; }
+        if (lines.Length < 3) return;
+        var header = lines[1].TrimEnd('\r').Split(new[] { "\",\"" }, StringSplitOptions.None)
+            .Select(x => x.Trim('"')).ToList();
+        int nameCol = header.IndexOf("Tagname");
+        int safeCol = header.IndexOf("IsSafety");
+        int ctrlCol = header.IndexOf("IsControl");
+        int multiCol = header.IndexOf("EnableMultipleWrites");
+        if (nameCol < 0 || safeCol < 0 || ctrlCol < 0) return;
+
+        int reclassified = 0, multi = 0;
+        for (int i = 2; i < lines.Length; i++)
+        {
+            if (string.IsNullOrWhiteSpace(lines[i])) continue;
+            var f = lines[i].TrimEnd('\r').Split(new[] { "\",\"" }, StringSplitOptions.None);
+            if (f.Length <= Math.Max(nameCol, Math.Max(safeCol, ctrlCol))) continue;
+            string name = f[nameCol].Trim('"').Split('\n')[0].Trim();
+            if (name.Length == 0) continue;
+            bool changed = false;
+            if (safetyWrites.Contains(name) && f[ctrlCol].Trim('"').Equals("True", StringComparison.OrdinalIgnoreCase))
+            {
+                f[safeCol] = "True";
+                f[ctrlCol] = "False";
+                reclassified++;
+                changed = true;
+            }
+            if (multiCol >= 0 && writeCount.TryGetValue(name, out int wc) && wc > 1
+                && !f[multiCol].Trim('"').Equals("True", StringComparison.OrdinalIgnoreCase))
+            {
+                f[multiCol] = "True";
+                multi++;
+                changed = true;
+            }
+            if (changed) lines[i] = string.Join("\",\"", f);
+        }
+        if (reclassified == 0 && multi == 0) return;
+        tree[ti] = (tree[ti].Path, new UTF8Encoding(false).GetBytes(string.Join("\n", lines)));
+        if (reclassified > 0)
+            Console.WriteLine($"  tags: reclassified {reclassified} CONTROL tag(s) written by a safety program as safety");
+        if (multi > 0)
+            Console.WriteLine($"  tags: enabled multiple writes for {multi} tag(s) written by more than one placement");
+    }
+
+
+    /// Returns the input list unchanged when the tag table carries no control flags.</summary>
+    private static List<string> FilterControlWriteConflicts(
+        List<(string Path, byte[] Data)> tree, XDocument xml, List<string> names)
+    {
+        int ti = tree.FindIndex(t => t.Path.Equals("Current/Tagnames/Tagnames.csv", StringComparison.OrdinalIgnoreCase));
+        if (ti < 0) return names;
+        string[] lines;
+        try { lines = Encoding.UTF8.GetString(tree[ti].Data).Split('\n'); }
+        catch { return names; }
+        if (lines.Length < 3) return names;
+
+        var header = lines[1].TrimEnd('\r').Split(new[] { "\",\"" }, StringSplitOptions.None)
+            .Select(x => x.Trim('"')).ToList();
+        int nameCol = header.IndexOf("Tagname");
+        int ctrlCol = header.IndexOf("IsControl");
+        if (nameCol < 0 || ctrlCol < 0) return names;
+
+        var control = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in lines.Skip(2))
+        {
+            if (string.IsNullOrWhiteSpace(raw)) continue;
+            var f = raw.TrimEnd('\r').Split(new[] { "\",\"" }, StringSplitOptions.None);
+            if (f.Length <= Math.Max(nameCol, ctrlCol)) continue;
+            if (!f[ctrlCol].Trim('"').Equals("True", StringComparison.OrdinalIgnoreCase)) continue;
+            // Reject the newline that the CSV writer leaves inside a multi-line description.
+            string n = f[nameCol].Trim('"').Split('\n')[0].Trim();
+            if (n.Length > 0) control.Add(n);
+        }
+        if (control.Count == 0) return names;
+
+        // Tag names written by a program: every variable placement whose connectionPointIn
+        // carries a <connection> (the RHS drives it). Coils count as writes in ladder bodies.
+        var writes = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pou in xml.Descendants().Where(e => e.Name.LocalName == "pou"
+                     && string.Equals((string?)e.Attribute("pouType"), "program", StringComparison.OrdinalIgnoreCase)))
+        {
+            string pname = (string?)pou.Attribute("name") ?? "";
+            if (pname.Length == 0) continue;
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var el in pou.Descendants().Where(e => e.Name.LocalName is "inOutVariable" or "outVariable" or "coil"))
+            {
+                var cpi = el.Elements().FirstOrDefault(e => e.Name.LocalName == "connectionPointIn");
+                if (cpi == null || !cpi.Descendants().Any(e => e.Name.LocalName == "connection")) continue;
+                string expr = el.Elements().FirstOrDefault(e => e.Name.LocalName == "expression")?.Value?.Trim() ?? "";
+                if (expr.Length > 0 && control.Contains(expr)) set.Add(expr);
+            }
+            writes[pname] = set;
+        }
+
+        var scheduled = new List<string>();
+        var owner = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string n in names.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!writes.TryGetValue(n, out var ws) || ws.Count == 0) { scheduled.Add(n); continue; }
+            string? hit = ws.FirstOrDefault(t => owner.ContainsKey(t));
+            if (hit != null)
+            {
+                Console.WriteLine($"  execution list: left '{n}' unscheduled; its write of CONTROL tag '{hit}' "
+                                  + $"is already handled by '{owner[hit]}' (safety/control split)");
+                continue;
+            }
+            scheduled.Add(n);
+            foreach (string t in ws) owner[t] = n;
+        }
+        return scheduled;
+    }
+
+
     private static void RenameHardwarePoints(List<(string Path, byte[] Data)> tree)
     {
         int hi = tree.FindIndex(t => t.Path.Equals("Current/Elements/Configuration/HwConfiguration.xml", StringComparison.OrdinalIgnoreCase));
@@ -1491,7 +1670,7 @@ public static class BuildXml
     }
 
     /// <summary>
-    /// Reports drawn placements TriStation cannot represent (empty, numeric, "dir/â€¦", "L%4102",
+    /// Reports drawn placements TriStation cannot represent (empty, numeric, "dir/Ã¢â‚¬Â¦", "L%4102",
     /// or reserved names). The importer drops them silently, so surfacing the count keeps the loss
     /// visible instead of letting the conversion look lossless.
     /// </summary>
@@ -1521,7 +1700,7 @@ public static class BuildXml
     /// <summary>
     /// Copies the compiled library binaries (<c>Current/Bin/*</c> .EMA/.NCA/.emo/.nco) out of
     /// the XML's embedded <c>LIBRARY_DATA</c> compound files when they differ in size from the
-    /// template's copy â€” that means the XML was exported from a TriStation with a different
+    /// template's copy Ã¢â‚¬â€ that means the XML was exported from a TriStation with a different
     /// library build. Same-size streams are kept as-is: TriStation itself keeps the installed
     /// copy on import, so replacing them would only diverge from the reference import.
     /// </summary>
