@@ -702,6 +702,19 @@ public static partial class FbdGenerator
         p.Version = p.PouType == "functionblock" ? "1.1" : "1.0";
 
         var iface = pou.Elements().FirstOrDefault(e => e.Name.LocalName == "interface");
+        // 5.8 rejects a variable declaration whose name shadows a library element (WF0025),
+        // even when the 4.x project declared it (e.g. a BOOL called "max" or "min"). Rename
+        // the declaration and every drawn reference consistently; the logic is unchanged.
+        var renames = new Dictionary<string, string>(StringComparer.Ordinal);
+        string MakeUniqueName(string baseName)
+        {
+            string candidate = baseName;
+            int n = 1;
+            while (p.Vars.Any(x => x.Name.Equals(candidate, StringComparison.OrdinalIgnoreCase))
+                   || renames.Values.Any(v => v.Equals(candidate, StringComparison.OrdinalIgnoreCase)))
+                candidate = baseName + (++n);
+            return candidate;
+        }
         if (iface != null)
         {
             foreach (var (secName, secKind) in new[] { ("inputVars", "input"), ("inOutVars", "inOut"),
@@ -722,9 +735,32 @@ public static partial class FbdGenerator
                     }
                     var initEl = v.Elements().FirstOrDefault(e => e.Name.LocalName == "initialValue")
                         ?.Elements().FirstOrDefault(e => e.Name.LocalName == "simpleValue");
+                    string varName = A(v, "name");
+                    string originalName = varName;
+                    if (!IsConstantName(varName) && IsIdentifierName(varName))
+                    {
+                        if (LibraryNames.Contains(varName) && !renames.ContainsKey(varName))
+                        {
+                            varName = MakeUniqueName(varName + "_var");
+                            renames[originalName] = varName;
+                        }
+                    }
+                    else if (!IsConstantName(varName) && varName.Length > 0 && varName.Length <= 32
+                             && varName.IndexOf('/') < 0 && !renames.ContainsKey(varName))
+                    {
+                        // A simple name with a character 5.8 rejects in declarations (e.g.
+                        // "L%4102") is still a real variable the drawing writes to. Sanitise it
+                        // instead of dropping the declaration and the net that uses it.
+                        var sb = new StringBuilder();
+                        foreach (char ch in varName)
+                            sb.Append(char.IsLetterOrDigit(ch) || ch == '_' ? ch : '_');
+                        if (sb.Length > 0 && !char.IsLetter(sb[0]) && sb[0] != '_') sb.Insert(0, '_');
+                        varName = MakeUniqueName(sb.ToString());
+                        renames[originalName] = varName;
+                    }
                     p.Vars.Add(new ExVar
                     {
-                        Name = A(v, "name"),
+                        Name = varName,
                         Section = secKind,
                         DataType = dtype,
                         Derived = derived != null ? A(derived, "name") : "",
@@ -733,12 +769,15 @@ public static partial class FbdGenerator
                     });
                 }
             }
+            if (renames.Count > 0)
+                Console.WriteLine($"  {p.Name}: renamed {renames.Count} variable name(s) that 5.8 rejects "
+                                  + $"({string.Join(", ", renames.Select(kv => kv.Key + "->" + kv.Value))})");
             // The export repeats every referenced tag inside each program's <globalVars>;
             // the FBD's declarations collection lists each name once, and omits literals.
             // Names that are not identifiers (empty, "dir/…", "L%4102"), or that shadow a
             // library element (max/min), are not variables in TriStation's declarations.
             var seen = new HashSet<string>(StringComparer.Ordinal);
-            p.Vars = p.Vars.Where(x => seen.Add(x.Name) && IsDeclarableName(x.Name)).ToList();
+            p.Vars = p.Vars.Where(x => seen.Add(x.Name) && IsIdentifierName(x.Name)).ToList();
         }
 
         var fbd = pou.Descendants().FirstOrDefault(e => e.Name.LocalName == "FBD")
@@ -792,6 +831,11 @@ public static partial class FbdGenerator
         }
 
         int docIndex = 0;
+        // Placements the importer would not keep because their text is empty or not a valid
+        // identifier. They are normally invisible, but when one is still referenced by a block
+        // input the export lost the literal it stood for (e.g. PACK16 pads). Keep them on the
+        // side so the repair pass below can turn the dangling link into a literal 0.
+        var droppedPlacements = new Dictionary<int, ExVarPlace>();
         foreach (var el in fbd.Elements())
         {
             string ln = el.Name.LocalName;
@@ -839,6 +883,9 @@ public static partial class FbdGenerator
                     Sheet = int.Parse(AL(Pos(el)!, "SheetNumber", "1")),
                     Expression = TextTrim(el.Elements().FirstOrDefault(e => e.Name.LocalName == "expression")),
                 };
+                // A declared variable that had to be renamed (library-name shadow) must be
+                // looked up under its new name here as well.
+                if (renames.TryGetValue(v.Expression, out var renamedExpr)) v.Expression = renamedExpr;
                 var cpi = el.Elements().FirstOrDefault(e => e.Name.LocalName == "connectionPointIn");
                 v.InConn = ParseConn(cpi?.Elements().FirstOrDefault(e => e.Name.LocalName == "connection"));
                 var itemExt = el.Elements().FirstOrDefault(e => e.Name.LocalName == "FBDITEM_EXT");
@@ -859,13 +906,19 @@ public static partial class FbdGenerator
                 if (annMon != null) v.MonitorValue = TextTrim(annMon);
                 v.IsConstant = IsConstantName(v.Expression);
                 // TriStation drops drawn placeholders that are not valid identifiers (empty,
-                // "10", "dir/…", "L%4102", "max"/"min"); a literal is only valid on an input
-                // (inVariable) where it is a constant. Which placements survive is visible in
-                // the imported FBD: invalid names appear nowhere, not even as declarations.
-                bool keepPlacement = v.Kind == "in"
-                    ? v.IsConstant || IsDeclarableName(v.Expression)
-                    : IsDeclarableName(v.Expression);
-                if (!keepPlacement) continue;
+                // "10", "dir/…", "L%4102"). A constant is different: the export can
+                // draw it as an inVariable *or* an inOutVariable (e.g. TRUE feeding a NOT input),
+                // and both must survive as a literal placement or the consuming pin is left
+                // unconnected (WG0018). Unwired constants are still pruned as dangling below.
+                bool keepPlacement = v.IsConstant
+                    || p.Vars.Any(x => x.Name == v.Expression)
+                    || IsDeclarableName(v.Expression);
+                if (!keepPlacement)
+                {
+                    int dropId = int.Parse(A(el, "localId", "-1"));
+                    if (dropId >= 0) { v.ExportId = dropId; droppedPlacements[dropId] = v; }
+                    continue;
+                }
                 if (v.InConn != null) { v.InConn.Owner = v; p.ConnOrder.Add(v.InConn); }
                 p.Placements.Add(v);
                 p.ElemOrder.Add(v);
@@ -918,6 +971,80 @@ public static partial class FbdGenerator
             }
         }
 
+        // The export can lose the source of a block input: a drawn placeholder whose text is
+        // empty or corrupted, or a reference to an element that is not in the file at all.
+        // 5.8 leaves the pin bare and fails the build with WG0018. Neither case carries usable
+        // logic, so the only non-invented repair is a literal 0 (the neutral value) at the
+        // original source position. Report every substitution so it is visible in the build log.
+        int repairedInputs = 0;
+        var repairedNames = new List<string>();
+        var synthesized = new Dictionary<int, ExVarPlace>();
+        var knownIds = new HashSet<int>(p.ElemOrder.Where(e => e.ExportId >= 0).Select(e => e.ExportId));
+        foreach (var c in p.ConnOrder)
+        {
+            if (c.Owner is not ExBlock tb || c.OwnerPin.Length == 0) continue;
+            var pin = tb.Inputs.FirstOrDefault(x => x.Name == c.OwnerPin);
+            if (pin == null) continue; // only block input pins
+            bool known = knownIds.Contains(c.SrcExportId);
+            droppedPlacements.TryGetValue(c.SrcExportId, out var lost);
+            if (known && lost == null) continue;
+            if (synthesized.ContainsKey(c.SrcExportId)) continue;
+
+            int x, y, w, h, sheet;
+            if (lost != null)
+            {
+                x = lost.X; y = lost.Y; w = lost.W; h = lost.H; sheet = lost.Sheet;
+            }
+            else if (pin.RelY > 0)
+            {
+                // The connection path is stale (it points at a spot with no element). Place the
+                // literal where a normal constant sits: just left of the pin, centred on its row,
+                // so the direct pin link is geometrically valid.
+                x = tb.X - 7;
+                y = tb.Y + pin.RelY - 1;
+                w = 5; h = 2; sheet = tb.Sheet;
+            }
+            else if (c.Path.Count > 0)
+            {
+                (x, y) = c.Path[^1]; w = 18; h = 2; sheet = tb.Sheet;
+            }
+            else continue;
+
+            string dt = "BOOL";
+            if (Lib.TryGetValue(tb.TypeName, out var meta))
+            {
+                var lp = meta.Pins.FirstOrDefault(x2 => x2.Vt == 0 && x2.Name == c.OwnerPin);
+                if (lp != null && lp.DataType.Length > 0) dt = lp.DataType;
+            }
+            // A REAL literal needs a decimal point; "0" is rejected as incompatible (WF0045).
+            bool real = dt.Equals("REAL", StringComparison.OrdinalIgnoreCase)
+                     || dt.Equals("LREAL", StringComparison.OrdinalIgnoreCase);
+            var fix = new ExVarPlace
+            {
+                DocIndex = tb.DocIndex,
+                Kind = "in",
+                X = x, Y = y, W = w, H = h,
+                Sheet = sheet,
+                Expression = real ? "0.0" : "0",
+                IsConstant = true,
+                DataType = dt,
+                Annotation = "",
+                Annotate = "FALSE",
+                MonitorValue = "FALSE",
+                ExportId = c.SrcExportId,
+            };
+            p.Placements.Add(fix);
+            p.ElemOrder.Add(fix);
+            p.ByExportId[fix.ExportId] = fix;
+            synthesized[fix.ExportId] = fix;
+            knownIds.Add(fix.ExportId);
+            repairedInputs++;
+            repairedNames.Add($"{tb.TypeName}.{c.OwnerPin}");
+        }
+        if (repairedInputs > 0)
+            Console.WriteLine($"  {p.Name}: replaced {repairedInputs} block input source(s) lost in the export "
+                              + $"with literal 0 ({string.Join(", ", repairedNames.Distinct().Take(10))})");
+
         // A placement with no incoming connection and no connection referencing it cannot carry
         // any logic, yet TriStation still compiles it and reports WG0001 ("not connected to any
         // other network element"). Older exports are full of stray variables left on the sheet.
@@ -961,10 +1088,10 @@ public static partial class FbdGenerator
         return double.TryParse(name, NumberStyles.Any, CultureInfo.InvariantCulture, out _);
     }
 
-    // A name is written to the FBD declarations only when it is a plain identifier, is not
-    // a literal, and does not shadow a library element. Anything else (empty, "dir/…",
-    // "L%4102", "max"/"min") is a drawn placeholder that TriStation never declares.
-    public static bool IsDeclarableName(string name)
+    // A name is written to the FBD declarations only when it is a plain identifier and is not
+    // a literal. Anything else (empty, "dir/…", "L%4102") is a drawn placeholder that
+    // TriStation never declares.
+    private static bool IsIdentifierName(string name)
     {
         if (string.IsNullOrEmpty(name) || IsConstantName(name)) return false;
         if (name.IndexOfAny(new[] { '/', '%', ' ' }) >= 0) return false;
@@ -974,8 +1101,14 @@ public static partial class FbdGenerator
             char c = name[i];
             if (!char.IsLetterOrDigit(c) && c != '_') return false;
         }
-        return !LibraryNames.Contains(name);
+        return true;
     }
+
+    // A drawn placement is declarable when it is a plain identifier that does not shadow a
+    // library element. A name that *is* declared in the POU interface (e.g. a variable called
+    // "max"/"min") is still kept by the caller; only undeclared shadows are placeholders.
+    public static bool IsDeclarableName(string name)
+        => IsIdentifierName(name) && !LibraryNames.Contains(name);
 
     private static bool IsBoolConstant(ExVarPlace v) =>
         v.DataType.Equals("BOOL", StringComparison.OrdinalIgnoreCase) ||
@@ -2165,6 +2298,7 @@ public static partial class FbdGenerator
         bool duplicated = forceDuplicated;
         var plan = BuildPlan(p);
         plan.ProjectTypes = projectTypes;
+        RetypeVariablesForConsumers(plan);
         _ = _commentIds;
         ComputeLayout(plan);
         // The ST layout above uses the logical wires; the FBD document uses the editor's
@@ -2172,6 +2306,17 @@ public static partial class FbdGenerator
         DecomposeNets(plan);
         RepairWireRefs(plan);
         AssignWireIds(plan);
+        // After decomposition, a constant's OutWire must name the net's *root* wire (the one
+        // whose source is the literal). Pointing it at a branch arm (Vn) breaks the net and the
+        // compiler reports the fed pins as unconnected (WG0018).
+        foreach (var kv in plan.Places)
+        {
+            if (kv.Key is not ExVarPlace cv || !cv.IsConstant) continue;
+            var root = plan.Wires.FirstOrDefault(
+                w => !w.Drop && !w.Suppress && ReferenceEquals(w.SourceVar, cv));
+            if (root != null) kv.Value.OutWire = root;
+        }
+        NormalizeWireGeometry(plan);
         plan.LastId = duplicated ? 2 * plan.PrimarySpan : plan.PrimarySpan;
 
         string sheetTemplate = p.SheetTemplate.Length > 0 ? p.SheetTemplate : "SheetTemplateD";
@@ -2502,19 +2647,22 @@ public static partial class FbdGenerator
         // resolves them from the direct pin link); forcing one makes it look for a net that
         // does not exist and reports the literal as unconnected.
         string netAttr = "";
-        bool wired = pp.OutWire != null && !pp.OutWire.Suppress;
-        if (v.IsConstant && v.Kind != "in" && !wired) return null;
-        if (v.IsConstant && v.Kind == "in")
+        // A constant drawn as an inVariable or an inOutVariable is emitted the same way: a
+        // CONSTANT out-variable. Only its kind differs in the export, not its meaning. An
+        // unwired non-input constant carries no logic and is omitted.
+        if (v.IsConstant && v.Kind != "in" && pp.OutWire == null) return null;
+        if (v.IsConstant)
         {
             var ow = pp.OutWire;
             string outConn; int outId;
             if (ow != null && ow.Suppress) { outConn = ow.TargetPin; outId = elementIdOf(plan, ow.Target) + idOffset; }
             else if (ow != null) { outConn = "IN1"; outId = ow.Id + idOffset; }
             else { outConn = ""; outId = 0; }
-            string dt = v.DataType.Length > 0 ? v.DataType : (v.Expression.Contains('.') ? "REAL" : "DINT");
+            var (literal, dt) = ConstantValue(plan, v,
+                ow?.TargetBlock, ow?.TargetPin ?? "", ow?.TargetVar, ow?.Suppress == true);
             bool annotate = v.Annotate.Equals("true", StringComparison.OrdinalIgnoreCase);
             int annHeight = annotate ? Math.Max(1, v.H - 2) : 4;
-            return $"<Class ClassType=\"CFBDOutVarXml\" varName=\"{Esc(v.Expression)}\" varType=\"CONSTANT\""
+            return $"<Class ClassType=\"CFBDOutVarXml\" varName=\"{Esc(literal)}\" varType=\"CONSTANT\""
                  + $" varDataType=\"{Esc(dt)}\" localId=\"{id}\" posX=\"{Tx(v.X)}\" posY=\"{Tx(v.Y)}\""
                  + $" width=\"{10 * v.W}\" height=\"{10 * v.H}\"{netAttr} outConnection=\"{Esc(outConn)}\""
                  + $" outConnectId=\"{outId}\" annotation=\"{Esc(v.Annotation)}\" annotate=\"{Title(v.Annotate)}\""
@@ -2543,6 +2691,210 @@ public static partial class FbdGenerator
             sb.Append($" inConnection=\"{Esc(pp.InWire.SourcePin)}\" inConnectId=\"{elementIdOf(plan, pp.InWire.Source) + idOffset}\"");
         sb.Append("/>");
         return sb.ToString();
+    }
+
+    /// <summary>Declared data type of a block input pin. The pin is matched by position in the
+    /// export's input list, because the exported formal parameter can be a stale alias.</summary>
+    private static string PinDataType(ExBlock b, string pin)
+    {
+        if (!Lib.TryGetValue(b.TypeName, out var meta)) return "";
+        int idx = b.Inputs.FindIndex(x => x.Name == pin);
+        if (idx < 0) return "";
+        var pins = meta.Pins.Where(p => p.Vt == 0).ToList();
+        return idx < pins.Count ? pins[idx].DataType : "";
+    }
+
+    private static string BlockOutputType(ExBlock b, string pin)
+    {
+        if (!Lib.TryGetValue(b.TypeName, out var meta)) return "";
+        int idx = b.Outputs.FindIndex(x => x.Name == pin);
+        if (idx < 0) return "";
+        var pins = meta.Pins.Where(p => p.Vt == 1).ToList();
+        return idx < pins.Count ? pins[idx].DataType : "";
+    }
+
+    private static bool IsGenericType(string t)
+        => t.Length == 0 || t.Equals("BIT", StringComparison.OrdinalIgnoreCase)
+           || t.StartsWith("ANY", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>An export can declare a variable with a type that contradicts every consumer
+    /// (e.g. BOOL variables wired into AIN's DINT/REAL pins). When a variable feeds only block
+    /// inputs that agree on one concrete type, adopt that type so the generated declarations and
+    /// constants are consistent. Variables used in generic bit logic are left alone.</summary>
+    private static void RetypeVariablesForConsumers(Plan plan)
+    {
+        var p = plan.P;
+        var expected = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var bitUse = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var w in plan.Wires)
+        {
+            if (w.SourceVar == null || w.IsBranch) continue;
+            string name = w.SourceVar.Expression;
+            var decl = p.Vars.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (decl == null || decl.IsInstance) continue;
+            if (decl.Section is "input" or "output" or "inOut") continue; // interface is fixed
+            if (w.TargetBlock == null || w.TargetPin.Length == 0) continue;
+            string t = PinDataType(w.TargetBlock, w.TargetPin);
+            if (t.Length == 0) continue;
+            if (IsGenericType(t))
+            {
+                if (t.Equals("ANY_BIT", StringComparison.OrdinalIgnoreCase) || t.Equals("BIT", StringComparison.OrdinalIgnoreCase))
+                    bitUse.Add(name);
+                continue;
+            }
+            if (!expected.TryGetValue(name, out var set))
+                expected[name] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            set.Add(t);
+        }
+        foreach (var kv in expected)
+        {
+            if (bitUse.Contains(kv.Key) || kv.Value.Count != 1) continue;
+            var decl = p.Vars.FirstOrDefault(x => x.Name.Equals(kv.Key, StringComparison.OrdinalIgnoreCase));
+            if (decl == null) continue;
+            string t = kv.Value.First();
+            if (decl.DataType.Equals(t, StringComparison.OrdinalIgnoreCase)) continue;
+            // A block output writing this variable with a different concrete type is a real
+            // conflict; leave the declaration as-is rather than break that assignment.
+            bool conflict = plan.Wires.Any(w =>
+            {
+                if (w.TargetVar == null
+                    || !w.TargetVar.Expression.Equals(decl.Name, StringComparison.OrdinalIgnoreCase)
+                    || w.SourceBlock == null) return false;
+                string ot;
+                if (w.SourceBlock.TypeName.Equals("MOVE", StringComparison.OrdinalIgnoreCase))
+                {
+                    // MOVE is a pass-through: its effective result type is its input operand's.
+                    var inWire = plan.Wires.FirstOrDefault(
+                        x => x.TargetBlock == w.SourceBlock && !x.IsBranch && x.SourceVar != null);
+                    // A literal adapts to the destination type, so it is not a conflict.
+                    ot = inWire == null || (inWire.SourceVar != null && inWire.SourceVar.IsConstant)
+                        ? ""
+                        : WireSourceType(plan, inWire);
+                }
+                else ot = BlockOutputType(w.SourceBlock, w.SourcePin);
+                return !IsGenericType(ot) && !ot.Equals(t, StringComparison.OrdinalIgnoreCase);
+            });
+            if (conflict) continue;
+            Console.WriteLine($"  {p.Name}: retyped variable '{decl.Name}' {decl.DataType}->{t} to match its consumers");
+            decl.DataType = t;
+        }
+    }
+
+    /// <summary>Literal text and concrete data type for a constant placement. The export often
+    /// omits DATATYPE, so the destination (block pin or variable declaration/tag) determines it;
+    /// BOOL/ANY_BIT/REAL literal text must then be adapted or 5.8 rejects it (WF0045).</summary>
+    /// <summary>Concrete type produced by a wire's source (variable declaration or block output).
+    /// Constants are not used as peers because their own type may be the one being resolved.</summary>
+    private static string WireSourceType(Plan plan, Wire w)
+    {
+        if (w.SourceVar != null)
+        {
+            if (w.SourceVar.IsConstant) return "";
+            var d = plan.P.Vars.FirstOrDefault(
+                x => x.Name.Equals(w.SourceVar.Expression, StringComparison.OrdinalIgnoreCase));
+            return d == null ? "" : (d.IsInstance ? d.Derived : d.DataType);
+        }
+        if (w.SourceBlock != null) return BlockOutputType(w.SourceBlock, w.SourcePin);
+        return "";
+    }
+
+    private static (string Literal, string DataType) ConstantValue(
+        Plan plan, ExVarPlace v, ExBlock? tb, string pin, ExVarPlace? tv, bool direct = false)
+    {
+        string pinType = tb == null ? "" : PinDataType(tb, pin);
+        bool pinIsBit = pinType.Equals("ANY_BIT", StringComparison.OrdinalIgnoreCase)
+                        || pinType.Equals("BIT", StringComparison.OrdinalIgnoreCase);
+        string dt = v.DataType;
+        // MOVE is a pass-through on generic ANY pins; when its destination variable has a
+        // concrete type, the literal (and the MOVE result) has that type. Exports often leave
+        // the literal typed DINT while the destination tag is BOOL (WC0002 in 5.8).
+        if (tb != null && tb.TypeName.Equals("MOVE", StringComparison.OrdinalIgnoreCase))
+        {
+            var outWire = plan.Wires.FirstOrDefault(
+                x => x.SourceBlock == tb && !x.IsBranch && x.TargetVar != null);
+            if (outWire?.TargetVar != null)
+            {
+                var outDecl = plan.P.Vars.FirstOrDefault(
+                    x => x.Name.Equals(outWire.TargetVar.Expression, StringComparison.OrdinalIgnoreCase));
+                if (outDecl != null)
+                {
+                    string ot = outDecl.IsInstance ? outDecl.Derived : outDecl.DataType;
+                    if (!IsGenericType(ot)) dt = ot;
+                }
+            }
+        }
+        // Generic comparison/logic pins (ANY_NOTE1, ANY_NUM, ...) take the type of the other
+        // operand; otherwise a DINT literal next to a BOOL/REAL signal is rejected (WC0032).
+        if (!pinIsBit && tb != null && IsGenericType(pinType))
+        {
+            var peers = plan.Wires
+                .Where(x => x.TargetBlock == tb && !x.IsBranch && x.TargetPin != pin)
+                .Select(x => WireSourceType(plan, x))
+                .Where(t => t.Length > 0 && !IsGenericType(t))
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (peers.Count == 1) dt = peers[0];
+        }
+        if (dt.Length == 0 && pinType.Length > 0) dt = pinType;
+        if (dt.Length == 0)
+        {
+            if (tb != null && pin.Length > 0) dt = PinDataType(tb, pin);
+            else if (tv != null)
+            {
+                var decl = plan.P.Vars.FirstOrDefault(
+                    x => x.Name.Equals(tv.Expression, StringComparison.OrdinalIgnoreCase));
+                if (decl != null) dt = decl.IsInstance ? decl.Derived : decl.DataType;
+                if (dt.Length == 0 && plan.P.TagDesc != null
+                    && plan.P.TagDesc.TryGetValue(tv.Expression, out var ti))
+                    dt = ti.DataType;
+            }
+        }
+        if (dt.Length == 0)
+            dt = (v.Expression.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
+                  || v.Expression.Equals("FALSE", StringComparison.OrdinalIgnoreCase))
+                 ? "BOOL"
+                 : (v.Expression.Contains('.') ? "REAL" : "DINT");
+
+        string literal = v.Expression;
+        string BoolLiteral(bool asBit)
+        {
+            bool value;
+            // Keep the export's own numeric 0/1 text: 5.8 stores a literal net that way, and
+            // it is also valid on a BOOL pin.
+            if (!asBit && (literal == "0" || literal == "1")) return literal;
+            if (literal.Equals("TRUE", StringComparison.OrdinalIgnoreCase)) value = true;
+            else if (literal.Equals("FALSE", StringComparison.OrdinalIgnoreCase)) value = false;
+            else if (double.TryParse(literal, NumberStyles.Any, CultureInfo.InvariantCulture, out double num))
+                value = num != 0;
+            else return literal;
+            return asBit ? (value ? "1" : "0") : (value ? "TRUE" : "FALSE");
+        }
+        if (pinIsBit)
+        {
+            // 5.8 rejects TRUE/FALSE against a generic ANY_BIT pin but accepts the numeric
+            // bit 1/0 typed BOOL (verified against its own compiler).
+            dt = "BOOL";
+            literal = BoolLiteral(true);
+        }
+        else if (dt.Equals("BOOL", StringComparison.OrdinalIgnoreCase))
+        {
+            // A direct pin link (constant -> pin) must carry the numeric bit text; a wired
+            // literal uses TRUE/FALSE.
+            literal = BoolLiteral(direct);
+        }
+        else if (dt.Equals("ANY_BIT", StringComparison.OrdinalIgnoreCase))
+        {
+            // 5.8 rejects TRUE/FALSE against a generic ANY_BIT pin but accepts the numeric bit
+            // 1/0 typed BOOL (verified against its own compiler).
+            dt = "BOOL";
+            literal = BoolLiteral(true);
+        }
+        else if ((dt.Equals("REAL", StringComparison.OrdinalIgnoreCase)
+                  || dt.Equals("LREAL", StringComparison.OrdinalIgnoreCase))
+                 && Regex.IsMatch(literal, @"^-?\d+$"))
+        {
+            literal += ".0";
+        }
+        return (literal, dt);
     }
 
     /// <summary>
@@ -2625,7 +2977,10 @@ public static partial class FbdGenerator
             if (w.Suppress)
             {
                 var sv = (ExVarPlace)w.Source;
-                sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\" effectiveParam=\"{Esc(sv.Expression)}\"")
+                string literal = sv.IsConstant
+                    ? ConstantValue(plan, sv, b, b.Inputs[i].Name, null, true).Literal
+                    : sv.Expression;
+                sb.Append($"<Class{inv} formalParam=\"{Esc(pinName)}\" effectiveParam=\"{Esc(literal)}\"")
                   .Append($" connectId=\"{elementIdOf(plan, w.Source) + idOffset}\"{lineOffset}/>");
                 continue;
             }
@@ -2663,11 +3018,181 @@ public static partial class FbdGenerator
         return sb.ToString();
     }
 
+    // ============================================================ wire geometry guard
+    //
+    // 4.x allowed two collinear wire segments to overlap; 5.8 rejects that with WF0032. The
+    // exported drawing is otherwise valid, so move an intermediate corner of one wire along
+    // the shared row/column to a free lane. Endpoints (pins) never move.
+
+    private readonly record struct SegRef(Wire W, int Index);
+    private readonly record struct Overlap(SegRef A, SegRef B, bool Horizontal, int Line, int Lo, int Hi);
+
+    private static void NormalizeWireGeometry(Plan plan)
+    {
+        var wires = plan.Wires.Where(w => !w.Suppress && !w.Drop && w.PathExport.Count >= 2).ToList();
+        // Junction points where a branch arm attaches to its parent trunk. These must never be
+        // removed or moved: the branch's connectId/effectiveParam (Vn) resolves to them.
+        var anchors = new HashSet<(int X, int Y)>();
+        foreach (var w in plan.Wires)
+            if (w.Parent != null && w.PathExport.Count > 0) anchors.Add(w.PathExport[^1]);
+        foreach (var g in wires.GroupBy(w => w.Target.Sheet))
+        {
+            var list = g.ToList();
+            if (list.Count < 2) continue;
+            var blocks = plan.P.Blocks.Where(b => b.Sheet == g.Key).ToList();
+            int guard = 0;
+            while (guard++ < 200)
+            {
+                var c = FindOverlap(list);
+                if (c == null) break;
+                if (!TryResolveOverlap(list, c.Value, blocks, anchors))
+                {
+                    var cw = c.Value;
+                    Console.WriteLine($"  {plan.P.Name}: warning: unresolved overlapping wires on sheet {g.Key}: "
+                        + $"wire {cw.A.W.Id} seg {cw.A.Index} vs wire {cw.B.W.Id} seg {cw.B.Index} at "
+                        + $"{(cw.Horizontal ? "y" : "x")}={cw.Line} [{cw.Lo},{cw.Hi}]");
+                    Console.WriteLine($"    A: {string.Join(" -> ", cw.A.W.PathExport.Select(p => $"({p.X},{p.Y})"))}");
+                    Console.WriteLine($"    B: {string.Join(" -> ", cw.B.W.PathExport.Select(p => $"({p.X},{p.Y})"))}");
+                    break;
+                }
+            }
+        }
+    }
+
+    private static void SimplifyPath(List<(int X, int Y)> p)
+    {
+        for (int i = p.Count - 2; i >= 1; i--)
+        {
+            if ((p[i - 1].X == p[i].X && p[i].X == p[i + 1].X)
+                || (p[i - 1].Y == p[i].Y && p[i].Y == p[i + 1].Y))
+                p.RemoveAt(i);
+        }
+    }
+
+    private static (int X1, int Y1, int X2, int Y2) Seg(List<(int X, int Y)> p, int i)
+        => (p[i].X, p[i].Y, p[i + 1].X, p[i + 1].Y);
+
+    private static Overlap? FindOverlap(List<Wire> wires)
+    {
+        for (int ai = 0; ai < wires.Count; ai++)
+            for (int bi = ai + 1; bi < wires.Count; bi++)
+            {
+                var a = wires[ai].PathExport; var b = wires[bi].PathExport;
+                for (int i = 0; i + 1 < a.Count; i++)
+                {
+                    var sa = Seg(a, i);
+                    for (int j = 0; j + 1 < b.Count; j++)
+                    {
+                        var sb = Seg(b, j);
+                        if (sa.Y1 == sa.Y2 && sb.Y1 == sb.Y2 && sa.Y1 == sb.Y1)
+                        {
+                            int lo = Math.Max(Math.Min(sa.X1, sa.X2), Math.Min(sb.X1, sb.X2));
+                            int hi = Math.Min(Math.Max(sa.X1, sa.X2), Math.Max(sb.X1, sb.X2));
+                            if (hi - lo > 0)
+                                return new Overlap(new SegRef(wires[ai], i), new SegRef(wires[bi], j), true, sa.Y1, lo, hi);
+                        }
+                        else if (sa.X1 == sa.X2 && sb.X1 == sb.X2 && sa.X1 == sb.X1)
+                        {
+                            int lo = Math.Max(Math.Min(sa.Y1, sa.Y2), Math.Min(sb.Y1, sb.Y2));
+                            int hi = Math.Min(Math.Max(sa.Y1, sa.Y2), Math.Max(sb.Y1, sb.Y2));
+                            if (hi - lo > 0)
+                                return new Overlap(new SegRef(wires[ai], i), new SegRef(wires[bi], j), false, sa.X1, lo, hi);
+                        }
+                    }
+                }
+            }
+        return null;
+    }
+
+    private static bool TryResolveOverlap(List<Wire> wires, Overlap c, List<ExBlock> blocks, HashSet<(int X, int Y)> anchors)
+    {
+        foreach (var seg in new[] { c.A, c.B })
+        {
+            var p = seg.W.PathExport;
+            for (int corner = seg.Index; corner <= seg.Index + 1; corner++)
+            {
+                if (corner <= 0 || corner >= p.Count - 1) continue;
+                int other = corner == seg.Index ? corner - 1 : corner + 1;
+                if (other <= 0 || other >= p.Count - 1) continue;
+                if (anchors.Contains(p[corner]) || anchors.Contains(p[other])) continue;
+                if (c.Horizontal)
+                {
+                    if (p[other].X != p[corner].X || p[other].Y == p[corner].Y) continue;
+                }
+                else
+                {
+                    if (p[other].Y != p[corner].Y || p[other].X == p[corner].X) continue;
+                }
+                foreach (int newCoord in new[] { c.Lo - 1, c.Hi + 1 })
+                {
+                    var pt = c.Horizontal ? (X: newCoord, Y: p[corner].Y) : (X: p[corner].X, Y: newCoord);
+                    var po = c.Horizontal ? (X: newCoord, Y: p[other].Y) : (X: p[other].X, Y: newCoord);
+                    if (pt == p[corner] && po == p[other]) continue;
+                    var trial = new List<(int X, int Y)>(p) { [corner] = pt, [other] = po };
+                    if (!PathValid(trial, seg.W, wires, blocks)) continue;
+                    p.Clear(); p.AddRange(trial);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static bool PathValid(List<(int X, int Y)> p, Wire self, List<Wire> wires, List<ExBlock> blocks)
+    {
+        for (int i = 0; i + 1 < p.Count; i++)
+        {
+            var s = Seg(p, i);
+            if (s.X1 == s.X2 && s.Y1 == s.Y2) return false;          // zero-length
+            if (s.X1 != s.X2 && s.Y1 != s.Y2) return false;          // not orthogonal
+            // block bodies: a wire may touch an edge, not run through it
+            foreach (var b in blocks)
+            {
+                int left = b.X, right = b.X + b.W, top = b.Y, bottom = b.Y + b.H;
+                if (s.Y1 == s.Y2)
+                {
+                    if (s.Y1 > top && s.Y1 < bottom
+                        && Math.Max(s.X1, s.X2) > left && Math.Min(s.X1, s.X2) < right) return false;
+                }
+                else
+                {
+                    if (s.X1 > left && s.X1 < right
+                        && Math.Max(s.Y1, s.Y2) > top && Math.Min(s.Y1, s.Y2) < bottom) return false;
+                }
+            }
+            // collinear overlap with any other wire (or a non-adjacent segment of this one)
+            foreach (var w in wires)
+            {
+                var q = w.PathExport;
+                for (int j = 0; j + 1 < q.Count; j++)
+                {
+                    if (ReferenceEquals(w, self) && (j == i || j == i - 1 || j == i + 1)) continue;
+                    var t = Seg(q, j);
+                    if (s.Y1 == s.Y2 && t.Y1 == t.Y2 && s.Y1 == t.Y1)
+                    {
+                        int lo = Math.Max(Math.Min(s.X1, s.X2), Math.Min(t.X1, t.X2));
+                        int hi = Math.Min(Math.Max(s.X1, s.X2), Math.Max(t.X1, t.X2));
+                        if (hi - lo > 0) return false;
+                    }
+                    else if (s.X1 == s.X2 && t.X1 == t.X2 && s.X1 == t.X1)
+                    {
+                        int lo = Math.Max(Math.Min(s.Y1, s.Y2), Math.Min(t.Y1, t.Y2));
+                        int hi = Math.Min(Math.Max(s.Y1, s.Y2), Math.Max(t.Y1, t.Y2));
+                        if (hi - lo > 0) return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     private static string EmitWire(Plan plan, Wire w, int idOffset = 0)
     {
         // A branch arm leaves the same source pin as its trunk; its "output" points at the
         // junction on the parent wire (connectId = parent id, effectiveParam = V<n>).
         string inputEffective = w.SourcePin;
+        if (!w.IsBranch && w.SourceVar != null && w.SourceVar.IsConstant)
+            inputEffective = ConstantValue(plan, w.SourceVar, w.TargetBlock, w.TargetPin, w.TargetVar).Literal;
         int inputConnect = elementIdOf(plan, w.Source) + idOffset;
         string outputEffective = w.IsBranch ? "V" + w.Vn : w.TargetPin;
         int outputConnect = (w.IsBranch ? w.Parent!.Id : elementIdOf(plan, w.Target)) + idOffset;
